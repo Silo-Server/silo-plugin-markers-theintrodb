@@ -3,6 +3,19 @@
   "version": "0.1.0",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
+  "presentation": {
+    "display_name": "TheIntroDB Markers",
+    "summary": "Fetch and submit intro, credits, recap, and preview markers through TheIntroDB.",
+    "description_markdown": "Adds community-maintained playback markers from TheIntroDB to movies and TV episodes. It can fetch markers without an account and can submit corrections or new markers when an API key is configured.",
+    "setup_markdown": "Install the plugin and enable **TheIntroDB** as a marker provider. Fetching works without configuration. Add your TheIntroDB API key if you want to submit markers or view account statistics.",
+    "homepage_url": "https://theintrodb.org",
+    "source_url": "https://github.com/Silo-Server/silo-plugin-markers-introdb",
+    "support_url": "https://github.com/Silo-Server/silo-plugin-markers-introdb/issues",
+    "changelog_url": "https://github.com/Silo-Server/silo-plugin-markers-introdb/releases",
+    "publisher_name": "Silo",
+    "publisher_url": "https://github.com/Silo-Server",
+    "license_spdx": "AGPL-3.0-only"
+  },
   "supported_platforms": [
     {
       "os": "darwin",

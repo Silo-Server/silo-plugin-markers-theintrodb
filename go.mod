@@ -3,7 +3,7 @@ module github.com/Silo-Server/silo-plugin-markers-introdb
 go 1.26.0
 
 require (
-	github.com/Silo-Server/silo-plugin-sdk v0.5.0
+	github.com/Silo-Server/silo-plugin-sdk v0.10.0
 	golang.org/x/time v0.14.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251202230838-ff82c1b0f217
 	google.golang.org/grpc v1.75.1
