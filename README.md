@@ -10,6 +10,11 @@ address TheIntroDB with a TMDB, TVDB, or IMDb ID and works without an account;
 submissions specifically require a TMDB ID and API key. Account statistics also
 require an API key.
 
+Each returned segment is preserved, including separate credits ranges around a
+mid-credits scene. Lookup responses are cached for up to 24 hours in a bounded
+cache; changing credentials or submitting a marker clears that cache. Quota
+responses include the upstream reset delay so Silo can schedule the next lookup.
+
 ## Configuration
 
 The `account` global config accepts an optional `api_key` string. Fetches work

@@ -8,11 +8,7 @@ import (
 	"time"
 )
 
-// Provider implements TheIntroDB marker provider behavior.
-// Movies are looked up by TMDB or IMDB ID; episodes additionally need a
-// season and episode number. The provider returns at most one Marker per
-// segment kind — when TheIntroDB has multiple candidate ranges (multiple
-// release versions), we pick the first usable one.
+// Provider converts TheIntroDB timestamps to playback markers.
 type Provider struct {
 	client *Client
 }
@@ -26,10 +22,8 @@ func NewProvider(client *Client) *Provider {
 
 func (p *Provider) ID() string { return ProviderID }
 
-// FetchMarkers issues a single GET /v3/media call and converts the
-// response into a Result. A nil Provider (or one with no usable
-// IDs) returns an empty result rather than an error so callers can
-// chain providers via the Registry.
+// FetchMarkers looks up and converts all segment occurrences for one item.
+// Missing identity or unsupported media kinds return an empty result.
 func (p *Provider) FetchMarkers(ctx context.Context, req Request) (Result, error) {
 	if p == nil || p.client == nil {
 		return Result{}, nil
@@ -65,35 +59,22 @@ func (p *Provider) FetchMarkers(ctx context.Context, req Request) (Result, error
 	}
 
 	result := Result{}
-	if m, ok := pickMarker(resp.Intro, MarkerKindIntro, req.Duration, true); ok {
-		result.Markers = append(result.Markers, m)
-	}
-	if m, ok := pickMarker(resp.Credits, MarkerKindCredits, req.Duration, false); ok {
-		result.Markers = append(result.Markers, m)
-	}
-	if m, ok := pickMarker(resp.Recap, MarkerKindRecap, req.Duration, true); ok {
-		result.Markers = append(result.Markers, m)
-	}
-	if m, ok := pickMarker(resp.Preview, MarkerKindPreview, req.Duration, false); ok {
-		result.Markers = append(result.Markers, m)
-	}
+	result.Markers = append(result.Markers, convertMarkers(resp.Intro, MarkerKindIntro, req.Duration)...)
+	result.Markers = append(result.Markers, convertMarkers(resp.Credits, MarkerKindCredits, req.Duration)...)
+	result.Markers = append(result.Markers, convertMarkers(resp.Recap, MarkerKindRecap, req.Duration)...)
+	result.Markers = append(result.Markers, convertMarkers(resp.Preview, MarkerKindPreview, req.Duration)...)
 	return result, nil
 }
 
-// pickMarker selects the best usable segment from a TheIntroDB response array.
-// `requireEnd` is true for segments where the end timestamp is the load-bearing
-// field (intro, recap) — they're allowed to start at 0 if `start_ms` is omitted.
-// For trailing segments (credits, preview) the start is required but the end
-// defaults to the file duration. When several candidates are usable (e.g. no
-// duration match narrowed the set), the most-submitted one wins, with higher
-// confidence breaking ties; with a single candidate this is the previous
-// first-usable behavior. Real per-segment confidence is used when present,
-// falling back to defaultConfidence only when the API omits it.
-func pickMarker(stamps []segmentTimestamps, kind MarkerKind, totalDuration time.Duration, requireEnd bool) (Marker, bool) {
-	best := Marker{}
-	bestSubs := -1
-	found := false
+// The API has already selected a release using duration_ms. Each array entry is
+// a separate occurrence; in particular, credits may surround a scene to keep.
+func convertMarkers(stamps []segmentTimestamps, kind MarkerKind, totalDuration time.Duration) []Marker {
+	requireEnd := kind == MarkerKindIntro || kind == MarkerKindRecap
+	var markers []Marker
 	for _, s := range stamps {
+		if !validTimestamp(s.StartMs) || !validTimestamp(s.EndMs) {
+			continue
+		}
 		start := time.Duration(0)
 		end := totalDuration
 		if s.StartMs != nil {
@@ -105,27 +86,21 @@ func pickMarker(stamps []segmentTimestamps, kind MarkerKind, totalDuration time.
 		if requireEnd && s.EndMs == nil {
 			continue
 		}
-		if !requireEnd && s.StartMs == nil {
+		// Zero is TheIntroDB's no-segment sentinel for credits and previews.
+		if !requireEnd && (s.StartMs == nil || start == 0) {
 			continue
 		}
-		if end <= start {
+		if end <= start || (totalDuration > 0 && end > totalDuration) {
 			continue
 		}
-		confidence := defaultConfidence
-		if s.Confidence != nil {
-			confidence = *s.Confidence
-		}
-		subs := 0
-		if s.SubmissionCount != nil {
-			subs = *s.SubmissionCount
-		}
-		if !found || subs > bestSubs || (subs == bestSubs && confidence > best.Confidence) {
-			best = Marker{Kind: kind, Start: start, End: end, Confidence: confidence, SubmissionCount: subs, Algorithm: Algorithm}
-			bestSubs = subs
-			found = true
-		}
+		markers = append(markers, Marker{Kind: kind, Start: start, End: end, Confidence: defaultConfidence, Algorithm: Algorithm})
 	}
-	return best, found
+	return markers
+}
+
+func validTimestamp(ms *int64) bool {
+	const maxMilliseconds = int64(1<<63-1) / int64(time.Millisecond)
+	return ms == nil || (*ms >= 0 && *ms <= maxMilliseconds)
 }
 
 // SubmitMarker contributes a single segment to TheIntroDB via POST /v3/submit.
