@@ -169,17 +169,17 @@ func (c *Client) fetchMedia(ctx context.Context, reqURL, apiKey string) (*mediaR
 		}
 
 		if resp.StatusCode == http.StatusNotFound {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			return nil, nil
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			return nil, rateLimitError(resp)
 		}
 
 		if resp.StatusCode >= 500 {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if attempt == maxRetries {
 				return nil, fmt.Errorf("introdb: server error %d after %d retries", resp.StatusCode, maxRetries)
 			}
@@ -194,13 +194,13 @@ func (c *Client) fetchMedia(ctx context.Context, reqURL, apiKey string) (*mediaR
 
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			return nil, fmt.Errorf("introdb: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 
 		var out mediaResponse
 		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(&out)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if decodeErr != nil {
 			return nil, fmt.Errorf("introdb: decode response: %w", decodeErr)
 		}
@@ -229,7 +229,7 @@ func (c *Client) submitSegment(ctx context.Context, body submitRequest) (*submit
 	if err != nil {
 		return nil, fmt.Errorf("introdb: submit request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return nil, rateLimitError(resp)
@@ -263,7 +263,7 @@ func (c *Client) fetchUserStats(ctx context.Context) (*userStatsResponse, error)
 	if err != nil {
 		return nil, fmt.Errorf("introdb: stats request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return nil, rateLimitError(resp)
