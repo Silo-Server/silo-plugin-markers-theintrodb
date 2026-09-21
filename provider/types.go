@@ -15,8 +15,8 @@ const ProviderID = "introdb"
 // changes.
 const Algorithm = "introdb:v3"
 
-// defaultConfidence is applied when TheIntroDB omits a per-segment confidence
-// in the /media response. Real per-segment confidence is preferred when present.
+// defaultConfidence is Silo's confidence policy for this provider. TheIntroDB
+// does not publish per-segment confidence or submission counts.
 const defaultConfidence = 0.9
 
 // DefaultBaseURL is the production TheIntroDB v3 endpoint. Overridable
@@ -58,12 +58,11 @@ type Result struct {
 }
 
 type Marker struct {
-	Kind            MarkerKind
-	Start           time.Duration
-	End             time.Duration
-	Confidence      float64
-	SubmissionCount int
-	Algorithm       string
+	Kind       MarkerKind
+	Start      time.Duration
+	End        time.Duration
+	Confidence float64
+	Algorithm  string
 }
 
 type SubmissionRequest struct {
@@ -131,13 +130,10 @@ type mediaResponse struct {
 // segmentTimestamps is the per-occurrence shape returned by TheIntroDB.
 // Either bound may be nil — for intro/recap, start may be omitted (segment
 // begins at file start); for credits/preview, end may be omitted (segment
-// runs to file end). Confidence and SubmissionCount are optional per-segment
-// quality signals used to rank multiple candidates for the same segment kind.
+// runs to file end).
 type segmentTimestamps struct {
-	StartMs         *int64   `json:"start_ms,omitempty"`
-	EndMs           *int64   `json:"end_ms,omitempty"`
-	Confidence      *float64 `json:"confidence,omitempty"`
-	SubmissionCount *int     `json:"submission_count,omitempty"`
+	StartMs *int64 `json:"start_ms,omitempty"`
+	EndMs   *int64 `json:"end_ms,omitempty"`
 }
 
 // submitRequest is the POST /v3/submit body. tmdb_id is required; start_ms and

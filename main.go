@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -17,10 +16,10 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	"github.com/Silo-Server/silo-plugin-markers-introdb/provider"
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	publicmanifest "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
 	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtime"
-	"github.com/Silo-Server/silo-plugin-markers-introdb/provider"
 )
 
 var version string
@@ -34,7 +33,6 @@ type runtimeServer struct {
 	manifest *pluginv1.PluginManifest
 	provider *provider.Provider
 	client   *provider.Client
-	mu       sync.RWMutex
 }
 
 type markerServer struct {
@@ -48,20 +46,12 @@ func (s *runtimeServer) GetManifest(context.Context, *pluginv1.GetManifestReques
 
 func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequest) (*pluginv1.ConfigureResponse, error) {
 	apiKey := apiKeyFromConfig(req.GetConfig())
-	s.mu.Lock()
 	s.client.SetAPIKey(apiKey)
-	s.mu.Unlock()
 	return &pluginv1.ConfigureResponse{}, nil
 }
 
-func (s *runtimeServer) providerForRequest() *provider.Provider {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.provider
-}
-
 func (s *markerServer) FetchMarkers(ctx context.Context, req *pluginv1.FetchMarkersRequest) (*pluginv1.FetchMarkersResponse, error) {
-	res, err := s.runtime.providerForRequest().FetchMarkers(ctx, requestFromProto(req))
+	res, err := s.runtime.provider.FetchMarkers(ctx, requestFromProto(req))
 	if err != nil {
 		return nil, providerError(err)
 	}
@@ -70,19 +60,18 @@ func (s *markerServer) FetchMarkers(ctx context.Context, req *pluginv1.FetchMark
 		start := marker.Start.Seconds()
 		end := marker.End.Seconds()
 		out.Markers = append(out.Markers, &pluginv1.MarkerSegment{
-			Segment:         markerKindName(marker.Kind),
-			StartSeconds:    &start,
-			EndSeconds:      &end,
-			Confidence:      marker.Confidence,
-			SubmissionCount: int32(marker.SubmissionCount),
-			Algorithm:       firstNonEmpty(marker.Algorithm, provider.Algorithm),
+			Segment:      markerKindName(marker.Kind),
+			StartSeconds: &start,
+			EndSeconds:   &end,
+			Confidence:   marker.Confidence,
+			Algorithm:    marker.Algorithm,
 		})
 	}
 	return out, nil
 }
 
 func (s *markerServer) SubmitMarker(ctx context.Context, req *pluginv1.SubmitMarkerRequest) (*pluginv1.SubmitMarkerResponse, error) {
-	res, err := s.runtime.providerForRequest().SubmitMarker(ctx, submissionFromProto(req))
+	res, err := s.runtime.provider.SubmitMarker(ctx, submissionFromProto(req))
 	if err != nil {
 		return nil, providerError(err)
 	}
@@ -94,7 +83,7 @@ func (s *markerServer) SubmitMarker(ctx context.Context, req *pluginv1.SubmitMar
 }
 
 func (s *markerServer) GetMarkerProviderStats(ctx context.Context, _ *pluginv1.GetMarkerProviderStatsRequest) (*pluginv1.MarkerProviderStatsResponse, error) {
-	stats, err := s.runtime.providerForRequest().FetchUserStats(ctx)
+	stats, err := s.runtime.provider.FetchUserStats(ctx)
 	if err != nil {
 		return nil, providerError(err)
 	}
@@ -115,7 +104,6 @@ func main() {
 		panic(err)
 	}
 	client := provider.NewClient("")
-	defer client.Close()
 	rt := &runtimeServer{
 		manifest: manifest,
 		client:   client,
@@ -277,13 +265,4 @@ func providerError(err error) error {
 		return st.Err()
 	}
 	return withDetails.Err()
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
 }

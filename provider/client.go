@@ -21,6 +21,7 @@ const (
 	maxResponseBody = 1 << 20 // 1 MB
 	defaultTimeout  = 15 * time.Second
 	defaultCacheTTL = 24 * time.Hour
+	maxCacheEntries = 1024
 )
 
 // Client is an HTTP client for the TheIntroDB /v3/media endpoint. Each
@@ -32,23 +33,20 @@ type Client struct {
 	apiKey     string
 	baseURL    string
 	limiter    *rate.Limiter
-	cache      *ttlCache[*mediaResponse]
-	cacheTTL   time.Duration
+	cache      *responseCache
 }
 
 // NewClient builds a Client with the canonical rate limit and cache TTL.
 // The apiKey may be empty — TheIntroDB serves read traffic without a key,
-// the key only gates access to the caller's own pending submissions.
+// authenticated reads also include the caller's pending submissions.
 func NewClient(apiKey string) *Client {
 	return &Client{
 		httpClient: &http.Client{Timeout: defaultTimeout},
 		apiKey:     strings.TrimSpace(apiKey),
 		baseURL:    DefaultBaseURL,
-		// TheIntroDB documents 30 requests / 10 seconds per IP. We stay
-		// conservatively below that: 2 req/s sustained, burst 5.
-		limiter:  rate.NewLimiter(2, 5),
-		cache:    newTTLCache[*mediaResponse](),
-		cacheTTL: defaultCacheTTL,
+		// Reads allow 30 requests / 10 seconds per IP or authenticated account.
+		limiter: rate.NewLimiter(2, 5),
+		cache:   newResponseCache(maxCacheEntries),
 	}
 }
 
@@ -56,22 +54,26 @@ func NewClient(apiKey string) *Client {
 func (c *Client) SetBaseURL(u string) {
 	c.mu.Lock()
 	c.baseURL = u
+	c.cache = newResponseCache(maxCacheEntries)
 	c.mu.Unlock()
 }
 
 // SetAPIKey rotates the bearer token in-place. Safe to call concurrently
-// with in-flight requests; subsequent requests use the new key.
+// with in-flight requests; subsequent requests use the new key and cache.
 func (c *Client) SetAPIKey(apiKey string) {
+	apiKey = strings.TrimSpace(apiKey)
 	c.mu.Lock()
-	c.apiKey = strings.TrimSpace(apiKey)
+	if c.apiKey != apiKey {
+		c.apiKey = apiKey
+		c.cache = newResponseCache(maxCacheEntries)
+	}
 	c.mu.Unlock()
 }
 
-// Close releases the background sweeper goroutine inside the response cache.
-func (c *Client) Close() {
-	if c.cache != nil {
-		c.cache.Close()
-	}
+func (c *Client) invalidateCache() {
+	c.mu.Lock()
+	c.cache = newResponseCache(maxCacheEntries)
+	c.mu.Unlock()
 }
 
 // FetchEpisode looks up segment timestamps for a TV episode.
@@ -92,7 +94,7 @@ func (c *Client) FetchEpisode(ctx context.Context, tmdbID, tvdbID, imdbID string
 	if durationMS > 0 {
 		q.Set("duration_ms", strconv.FormatInt(durationMS, 10))
 	}
-	return c.fetch(ctx, q, cacheKeyEpisode(tmdbID, tvdbID, imdbID, season, episode, durationMS))
+	return c.fetch(ctx, q)
 }
 
 // FetchMovie looks up segment timestamps for a movie.
@@ -106,7 +108,7 @@ func (c *Client) FetchMovie(ctx context.Context, tmdbID, tvdbID, imdbID string, 
 	if durationMS > 0 {
 		q.Set("duration_ms", strconv.FormatInt(durationMS, 10))
 	}
-	return c.fetch(ctx, q, cacheKeyMovie(tmdbID, tvdbID, imdbID, durationMS))
+	return c.fetch(ctx, q)
 }
 
 // setPreferredID writes exactly one id query parameter, preferring tmdb, then
@@ -122,72 +124,72 @@ func setPreferredID(q url.Values, tmdbID, tvdbID, imdbID string) {
 	}
 }
 
-func (c *Client) fetch(ctx context.Context, q url.Values, key string) (*mediaResponse, error) {
-	if cached, ok := c.cache.Get(key); ok {
+func (c *Client) fetch(ctx context.Context, q url.Values) (*mediaResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.mu.RLock()
+	baseURL, apiKey, cache := c.baseURL, c.apiKey, c.cache
+	c.mu.RUnlock()
+	key := q.Encode()
+	if cached, ok := cache.Get(key); ok {
 		return cached, nil
 	}
 
-	if err := c.limiter.Wait(ctx); err != nil {
-		return nil, err
+	result := cache.flights.DoChan(key, func() (any, error) {
+		if cached, ok := cache.Get(key); ok {
+			return cached, nil
+		}
+		// A canceled waiter must not cancel another caller's shared lookup.
+		// Bound the shared work even when all callers have stopped waiting.
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultTimeout)
+		defer cancel()
+		response, err := c.fetchMedia(fetchCtx, baseURL+"/media?"+key, apiKey)
+		if err == nil {
+			cache.Set(key, response, defaultCacheTTL)
+		}
+		return response, err
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case fetched := <-result:
+		if fetched.Err != nil {
+			return nil, fetched.Err
+		}
+		return fetched.Val.(*mediaResponse), nil
 	}
+}
 
-	c.mu.RLock()
-	baseURL := c.baseURL
-	apiKey := c.apiKey
-	c.mu.RUnlock()
-
-	reqURL := baseURL + "/media?" + q.Encode()
-
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-		if err != nil {
-			return nil, fmt.Errorf("introdb: create request: %w", err)
-		}
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("User-Agent", "Silo-Server/markers")
-		if apiKey != "" {
-			req.Header.Set("Authorization", "Bearer "+apiKey)
-		}
-
-		resp, err := c.httpClient.Do(req)
+func (c *Client) fetchMedia(ctx context.Context, reqURL, apiKey string) (*mediaResponse, error) {
+	for attempt := 0; ; attempt++ {
+		resp, err := c.do(ctx, http.MethodGet, reqURL, nil, apiKey)
 		if err != nil {
 			return nil, fmt.Errorf("introdb: request failed: %w", err)
 		}
 
 		if resp.StatusCode == http.StatusNotFound {
 			resp.Body.Close()
-			// Cache negatives too so the next playback start doesn't trigger
-			// another fetch for known-empty content.
-			c.cache.Set(key, nil, c.cacheTTL)
 			return nil, nil
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
 			resp.Body.Close()
-			if attempt < maxRetries {
-				backoff := retryAfterOrDefault(resp, attempt)
-				select {
-				case <-time.After(backoff):
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-				continue
-			}
-			return nil, fmt.Errorf("introdb: rate limited after %d retries", maxRetries)
+			return nil, rateLimitError(resp)
 		}
 
 		if resp.StatusCode >= 500 {
 			resp.Body.Close()
-			if attempt < maxRetries {
-				backoff := time.Duration(1<<attempt) * time.Second
-				select {
-				case <-time.After(backoff):
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-				continue
+			if attempt == maxRetries {
+				return nil, fmt.Errorf("introdb: server error %d after %d retries", resp.StatusCode, maxRetries)
 			}
-			return nil, fmt.Errorf("introdb: server error %d after %d retries", resp.StatusCode, maxRetries)
+			backoff := time.Duration(1<<attempt) * time.Second
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			continue
 		}
 
 		if resp.StatusCode >= 400 {
@@ -202,40 +204,7 @@ func (c *Client) fetch(ctx context.Context, q url.Values, key string) (*mediaRes
 		if decodeErr != nil {
 			return nil, fmt.Errorf("introdb: decode response: %w", decodeErr)
 		}
-		c.cache.Set(key, &out, c.cacheTTL)
 		return &out, nil
-	}
-	return nil, fmt.Errorf("introdb: max retries exceeded")
-}
-
-func retryAfterOrDefault(resp *http.Response, attempt int) time.Duration {
-	if val := resp.Header.Get("Retry-After"); val != "" {
-		if secs, err := strconv.Atoi(val); err == nil && secs > 0 {
-			return time.Duration(secs) * time.Second
-		}
-	}
-	return time.Duration(1<<attempt) * time.Second
-}
-
-func cacheKeyEpisode(tmdbID, tvdbID, imdbID string, season, episode int, durationMS int64) string {
-	switch {
-	case tmdbID != "":
-		return fmt.Sprintf("tmdb:%s:s%de%d:d%d", tmdbID, season, episode, durationMS)
-	case tvdbID != "":
-		return fmt.Sprintf("tvdb:%s:s%de%d:d%d", tvdbID, season, episode, durationMS)
-	default:
-		return fmt.Sprintf("imdb:%s:s%de%d:d%d", imdbID, season, episode, durationMS)
-	}
-}
-
-func cacheKeyMovie(tmdbID, tvdbID, imdbID string, durationMS int64) string {
-	switch {
-	case tmdbID != "":
-		return fmt.Sprintf("tmdb:movie:%s:d%d", tmdbID, durationMS)
-	case tvdbID != "":
-		return fmt.Sprintf("tvdb:movie:%s:d%d", tvdbID, durationMS)
-	default:
-		return fmt.Sprintf("imdb:movie:%s:d%d", imdbID, durationMS)
 	}
 }
 
@@ -256,37 +225,23 @@ func (c *Client) submitSegment(ctx context.Context, body submitRequest) (*submit
 	if err != nil {
 		return nil, fmt.Errorf("introdb: marshal submit: %w", err)
 	}
-	if err := c.limiter.Wait(ctx); err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/submit", bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("introdb: create submit request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Silo-Server/markers")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(ctx, http.MethodPost, baseURL+"/submit", bytes.NewReader(payload), apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("introdb: submit request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		after := time.Duration(usageResetSeconds(resp)) * time.Second
-		return nil, &RetryAfterError{
-			RetryAfter: after,
-			Message:    fmt.Sprintf("introdb: submit usage-limited; retry after %s", after),
-		}
+		return nil, rateLimitError(resp)
 	}
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
 		return nil, fmt.Errorf("introdb: submit HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 
+	// Submissions affect authenticated lookups immediately. Replacing the cache
+	// prevents an older in-flight fetch from repopulating it with stale data.
+	c.invalidateCache()
 	var out submitResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(&out); err != nil {
 		return nil, fmt.Errorf("introdb: decode submit response: %w", err)
@@ -304,24 +259,15 @@ func (c *Client) fetchUserStats(ctx context.Context) (*userStatsResponse, error)
 	if apiKey == "" {
 		return nil, fmt.Errorf("introdb: user stats require an API key")
 	}
-	if err := c.limiter.Wait(ctx); err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/user/stats", nil)
-	if err != nil {
-		return nil, fmt.Errorf("introdb: create stats request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "Silo-Server/markers")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(ctx, http.MethodGet, baseURL+"/user/stats", nil, apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("introdb: stats request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, rateLimitError(resp)
+	}
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
 		return nil, fmt.Errorf("introdb: stats HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
@@ -337,14 +283,53 @@ func (c *Client) fetchUserStats(ctx context.Context) (*userStatsResponse, error)
 	return &out, nil
 }
 
-// usageResetSeconds reads the usage/rate reset hint from a 429 response.
-func usageResetSeconds(resp *http.Response) int {
-	for _, h := range []string{"X-UsageLimit-Reset", "X-RateLimit-Reset", "Retry-After"} {
-		if v := resp.Header.Get(h); v != "" {
-			if s, err := strconv.Atoi(v); err == nil && s > 0 {
-				return s
-			}
-		}
+func (c *Client) do(ctx context.Context, method, endpoint string, body io.Reader, apiKey string) (*http.Response, error) {
+	if err := c.limiter.Wait(ctx); err != nil {
+		return nil, err
 	}
-	return 0
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Silo-Server/markers")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	return c.httpClient.Do(req)
+}
+
+func rateLimitError(resp *http.Response) error {
+	after := retryDelay(resp.Header, time.Now())
+	return &RetryAfterError{RetryAfter: after, Message: fmt.Sprintf("introdb: rate or usage limited; retry after %s", after)}
+}
+
+// Daily usage headers accompany successful requests too. Only honor a reset
+// for an exhausted quota, or when the response omits its remaining count.
+func retryDelay(headers http.Header, now time.Time) time.Duration {
+	after := retrySeconds(headers.Get("Retry-After"))
+	if date, err := http.ParseTime(headers.Get("Retry-After")); err == nil {
+		after = max(after, date.Sub(now))
+	}
+	for _, prefix := range []string{"X-UsageLimit-", "X-RateLimit-"} {
+		if remaining, err := strconv.ParseInt(headers.Get(prefix+"Remaining"), 10, 64); err == nil && remaining > 0 {
+			continue
+		}
+		after = max(after, retrySeconds(headers.Get(prefix+"Reset")))
+	}
+	if after <= 0 {
+		return 10 * time.Second
+	}
+	return after
+}
+
+func retrySeconds(value string) time.Duration {
+	seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || seconds <= 0 || seconds > int64(1<<63-1)/int64(time.Second) {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }
