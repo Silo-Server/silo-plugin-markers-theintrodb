@@ -1,56 +1,69 @@
 package provider
 
 import (
+	"container/list"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
-type ttlCacheEntry[T any] struct {
-	value     T
+type cacheEntry struct {
+	key       string
+	value     *mediaResponse
 	expiresAt time.Time
 }
 
-type ttlCache[T any] struct {
-	mu      sync.RWMutex
-	entries map[string]ttlCacheEntry[T]
+// responseCache bounds both positive and negative lookup results. Each cache
+// instance owns its in-flight requests so replacing it also isolates responses
+// fetched before a credential change or submission.
+type responseCache struct {
+	mu      sync.Mutex
+	entries map[string]*list.Element
+	order   list.List
+	limit   int
+	flights singleflight.Group
 }
 
-func newTTLCache[T any]() *ttlCache[T] {
-	return &ttlCache[T]{entries: map[string]ttlCacheEntry[T]{}}
+func newResponseCache(limit int) *responseCache {
+	return &responseCache{entries: make(map[string]*list.Element), limit: limit}
 }
 
-func (c *ttlCache[T]) Get(key string) (T, bool) {
-	var zero T
-	if c == nil {
-		return zero, false
-	}
-	now := time.Now()
-	c.mu.RLock()
-	entry, ok := c.entries[key]
-	c.mu.RUnlock()
+func (c *responseCache) Get(key string) (*mediaResponse, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	element, ok := c.entries[key]
 	if !ok {
-		return zero, false
+		return nil, false
 	}
-	if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
-		c.mu.Lock()
-		delete(c.entries, key)
-		c.mu.Unlock()
-		return zero, false
+	entry := element.Value.(cacheEntry)
+	if !time.Now().Before(entry.expiresAt) {
+		c.remove(element)
+		return nil, false
 	}
+	c.order.MoveToFront(element)
 	return entry.value, true
 }
 
-func (c *ttlCache[T]) Set(key string, value T, ttl time.Duration) {
-	if c == nil {
+func (c *responseCache) Set(key string, value *mediaResponse, ttl time.Duration) {
+	if c.limit <= 0 || ttl <= 0 {
 		return
 	}
-	expiresAt := time.Time{}
-	if ttl > 0 {
-		expiresAt = time.Now().Add(ttl)
-	}
 	c.mu.Lock()
-	c.entries[key] = ttlCacheEntry[T]{value: value, expiresAt: expiresAt}
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	entry := cacheEntry{key: key, value: value, expiresAt: time.Now().Add(ttl)}
+	if element, ok := c.entries[key]; ok {
+		element.Value = entry
+		c.order.MoveToFront(element)
+		return
+	}
+	c.entries[key] = c.order.PushFront(entry)
+	if c.order.Len() > c.limit {
+		c.remove(c.order.Back())
+	}
 }
 
-func (c *ttlCache[T]) Close() {}
+func (c *responseCache) remove(element *list.Element) {
+	delete(c.entries, element.Value.(cacheEntry).key)
+	c.order.Remove(element)
+}

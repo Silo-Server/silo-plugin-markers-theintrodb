@@ -21,6 +21,7 @@ const (
 	maxResponseBody = 1 << 20 // 1 MB
 	defaultTimeout  = 15 * time.Second
 	defaultCacheTTL = 24 * time.Hour
+	maxCacheEntries = 1024
 	clientUserAgent = "Silo-Server-TheIntroDB-Plugin/1.0 (+https://github.com/Silo-Server/silo-plugin-markers-theintrodb)"
 	// Missing and partial responses are deliberately short-lived. A later
 	// playback should be able to discover newly contributed intro or credits
@@ -35,40 +36,25 @@ const (
 // instance has its own rate limiter and response cache; concurrent fetches
 // for the same lookup key collapse to a single HTTP round trip via the cache.
 type Client struct {
-	httpClient         *http.Client
-	mu                 sync.RWMutex
-	apiKey             string
-	baseURL            string
-	limiter            *rate.Limiter
-	cache              *ttlCache[*mediaResponse]
-	cacheTTL           time.Duration
-	incompleteCacheTTL time.Duration
-	blockedUntil       time.Time
-	inflightMu         sync.Mutex
-	inflight           map[string]*inflightCall
-}
-
-type inflightCall struct {
-	done     chan struct{}
-	response *mediaResponse
-	err      error
+	httpClient *http.Client
+	mu         sync.RWMutex
+	apiKey     string
+	baseURL    string
+	limiter    *rate.Limiter
+	cache      *responseCache
 }
 
 // NewClient builds a Client with the canonical rate limit and cache TTL.
 // The apiKey may be empty — TheIntroDB serves read traffic without a key,
-// the key only gates access to the caller's own pending submissions.
+// authenticated reads also include the caller's pending submissions.
 func NewClient(apiKey string) *Client {
 	return &Client{
 		httpClient: &http.Client{Timeout: defaultTimeout},
 		apiKey:     strings.TrimSpace(apiKey),
 		baseURL:    DefaultBaseURL,
-		// TheIntroDB documents 30 requests / 10 seconds per IP. We stay
-		// conservatively below that: 2 req/s sustained, burst 5.
-		limiter:            rate.NewLimiter(2, 5),
-		cache:              newTTLCache[*mediaResponse](),
-		cacheTTL:           defaultCacheTTL,
-		incompleteCacheTTL: defaultIncompleteCacheTTL,
-		inflight:           make(map[string]*inflightCall),
+		// Reads allow 30 requests / 10 seconds per IP or authenticated account.
+		limiter: rate.NewLimiter(2, 5),
+		cache:   newResponseCache(maxCacheEntries),
 	}
 }
 
@@ -76,22 +62,26 @@ func NewClient(apiKey string) *Client {
 func (c *Client) SetBaseURL(u string) {
 	c.mu.Lock()
 	c.baseURL = u
+	c.cache = newResponseCache(maxCacheEntries)
 	c.mu.Unlock()
 }
 
 // SetAPIKey rotates the bearer token in-place. Safe to call concurrently
-// with in-flight requests; subsequent requests use the new key.
+// with in-flight requests; subsequent requests use the new key and cache.
 func (c *Client) SetAPIKey(apiKey string) {
+	apiKey = strings.TrimSpace(apiKey)
 	c.mu.Lock()
-	c.apiKey = strings.TrimSpace(apiKey)
+	if c.apiKey != apiKey {
+		c.apiKey = apiKey
+		c.cache = newResponseCache(maxCacheEntries)
+	}
 	c.mu.Unlock()
 }
 
-// Close releases the background sweeper goroutine inside the response cache.
-func (c *Client) Close() {
-	if c.cache != nil {
-		c.cache.Close()
-	}
+func (c *Client) invalidateCache() {
+	c.mu.Lock()
+	c.cache = newResponseCache(maxCacheEntries)
+	c.mu.Unlock()
 }
 
 // FetchEpisode looks up segment timestamps for a TV episode.
@@ -105,14 +95,12 @@ func (c *Client) FetchEpisode(ctx context.Context, tmdbID, tvdbID, imdbID string
 	if season <= 0 || episode <= 0 {
 		return nil, fmt.Errorf("introdb: episode lookup requires season and episode > 0 (got %d/%d)", season, episode)
 	}
-	return c.fetchUsingIDs(ctx, tmdbID, tvdbID, imdbID, func(id externalIDCandidate) (url.Values, string) {
-		q := id.query()
+	return c.fetchUsingIDs(ctx, tmdbID, tvdbID, imdbID, func(q url.Values) {
 		q.Set("season", strconv.Itoa(season))
 		q.Set("episode", strconv.Itoa(episode))
 		if durationMS > 0 {
 			q.Set("duration_ms", strconv.FormatInt(durationMS, 10))
 		}
-		return q, "episode:" + q.Encode()
 	})
 }
 
@@ -122,217 +110,149 @@ func (c *Client) FetchMovie(ctx context.Context, tmdbID, tvdbID, imdbID string, 
 	if tmdbID == "" && tvdbID == "" && imdbID == "" {
 		return nil, fmt.Errorf("introdb: tmdb_id, tvdb_id, or imdb_id required")
 	}
-	return c.fetchUsingIDs(ctx, tmdbID, tvdbID, imdbID, func(id externalIDCandidate) (url.Values, string) {
-		q := id.query()
+	return c.fetchUsingIDs(ctx, tmdbID, tvdbID, imdbID, func(q url.Values) {
 		if durationMS > 0 {
 			q.Set("duration_ms", strconv.FormatInt(durationMS, 10))
 		}
-		return q, "movie:" + q.Encode()
 	})
-}
-
-type externalIDCandidate struct {
-	key   string
-	value string
-}
-
-func (id externalIDCandidate) query() url.Values {
-	return url.Values{id.key: []string{id.value}}
-}
-
-func externalIDCandidates(tmdbID, tvdbID, imdbID string) []externalIDCandidate {
-	ids := make([]externalIDCandidate, 0, 3)
-	if tmdbID != "" {
-		ids = append(ids, externalIDCandidate{key: "tmdb_id", value: tmdbID})
-	}
-	if tvdbID != "" {
-		ids = append(ids, externalIDCandidate{key: "tvdb_id", value: tvdbID})
-	}
-	if imdbID != "" {
-		ids = append(ids, externalIDCandidate{key: "imdb_id", value: imdbID})
-	}
-	return ids
 }
 
 // fetchUsingIDs tries identifiers in TMDB, TVDB, IMDb order. A 404 advances
 // to the next identity because TheIntroDB can have a record indexed under one
 // provider but not another. The first actual media response wins.
-func (c *Client) fetchUsingIDs(
-	ctx context.Context,
-	tmdbID, tvdbID, imdbID string,
-	request func(externalIDCandidate) (url.Values, string),
-) (*mediaResponse, error) {
-	for _, id := range externalIDCandidates(tmdbID, tvdbID, imdbID) {
-		q, key := request(id)
-		response, err := c.fetch(ctx, q, key)
-		if err != nil {
-			// Alternate identifiers help only when a particular identity is not
-			// indexed. They cannot recover transport, rate-limit, or WAF errors.
-			return nil, err
+func (c *Client) fetchUsingIDs(ctx context.Context, tmdbID, tvdbID, imdbID string, setParams func(url.Values)) (*mediaResponse, error) {
+	for _, id := range []struct{ key, value string }{
+		{"tmdb_id", tmdbID},
+		{"tvdb_id", tvdbID},
+		{"imdb_id", imdbID},
+	} {
+		if id.value == "" {
+			continue
 		}
-		if response != nil {
-			return response, nil
+		q := url.Values{id.key: []string{id.value}}
+		setParams(q)
+		response, err := c.fetch(ctx, q)
+		// Alternate identifiers help only when a particular identity is not
+		// indexed. They cannot recover transport, rate-limit, or WAF errors.
+		if err != nil || response != nil {
+			return response, err
 		}
 	}
 	return nil, nil
 }
 
-func (c *Client) fetch(ctx context.Context, q url.Values, key string) (*mediaResponse, error) {
-	if cached, ok := c.cache.Get(key); ok {
-		return cached, nil
-	}
-	if remaining := c.blockedCooldownRemaining(); remaining > 0 {
-		return nil, fmt.Errorf("introdb: requests paused after Cloudflare HTTP 403; retry in %s", remaining.Round(time.Second))
-	}
-
-	c.inflightMu.Lock()
-	if call, ok := c.inflight[key]; ok {
-		c.inflightMu.Unlock()
-		select {
-		case <-call.done:
-			return call.response, call.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	call := &inflightCall{done: make(chan struct{})}
-	c.inflight[key] = call
-	c.inflightMu.Unlock()
-
-	response, err := c.fetchUncached(ctx, q, key)
-	c.inflightMu.Lock()
-	call.response = response
-	call.err = err
-	close(call.done)
-	delete(c.inflight, key)
-	c.inflightMu.Unlock()
-	return response, err
-}
-
-func (c *Client) fetchUncached(ctx context.Context, q url.Values, key string) (*mediaResponse, error) {
-	if err := c.limiter.Wait(ctx); err != nil {
+func (c *Client) fetch(ctx context.Context, q url.Values) (*mediaResponse, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
 	c.mu.RLock()
-	baseURL := c.baseURL
-	apiKey := c.apiKey
+	baseURL, apiKey, cache := c.baseURL, c.apiKey, c.cache
 	c.mu.RUnlock()
+	key := q.Encode()
+	if cached, ok := cache.Get(key); ok {
+		return cached, nil
+	}
 
-	reqURL := baseURL + "/media?" + q.Encode()
-
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-		if err != nil {
-			return nil, fmt.Errorf("introdb: create request: %w", err)
+	result := cache.flights.DoChan(key, func() (any, error) {
+		if cached, ok := cache.Get(key); ok {
+			return cached, nil
 		}
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("User-Agent", clientUserAgent)
-		if apiKey != "" {
-			req.Header.Set("Authorization", "Bearer "+apiKey)
+		// A canceled waiter must not cancel another caller's shared lookup.
+		// Bound the shared work even when all callers have stopped waiting.
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultTimeout)
+		defer cancel()
+		response, err := c.fetchMedia(fetchCtx, baseURL+"/media?"+key, apiKey)
+		if err == nil {
+			cache.Set(key, response, responseCacheTTL(response))
 		}
+		return response, err
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case fetched := <-result:
+		if fetched.Err != nil {
+			return nil, fetched.Err
+		}
+		return fetched.Val.(*mediaResponse), nil
+	}
+}
 
-		resp, err := c.httpClient.Do(req)
+func (c *Client) fetchMedia(ctx context.Context, reqURL, apiKey string) (*mediaResponse, error) {
+	for attempt := 0; ; attempt++ {
+		resp, err := c.do(ctx, http.MethodGet, reqURL, nil, apiKey)
 		if err != nil {
 			return nil, fmt.Errorf("introdb: request failed: %w", err)
 		}
 
 		if resp.StatusCode == http.StatusNotFound {
-			resp.Body.Close()
-			// Cache negatives too so the next playback start doesn't trigger
-			// another fetch for known-empty content.
-			c.cache.Set(key, nil, c.incompleteCacheTTL)
+			_ = resp.Body.Close()
 			return nil, nil
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
-			if attempt < maxRetries {
-				backoff := retryAfterOrDefault(resp, attempt)
-				select {
-				case <-time.After(backoff):
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-				continue
-			}
-			return nil, fmt.Errorf("introdb: rate limited after %d retries", maxRetries)
+			_ = resp.Body.Close()
+			return nil, rateLimitError(resp)
 		}
 
 		if resp.StatusCode >= 500 {
-			resp.Body.Close()
-			if attempt < maxRetries {
-				backoff := time.Duration(1<<attempt) * time.Second
-				select {
-				case <-time.After(backoff):
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-				continue
+			_ = resp.Body.Close()
+			if attempt == maxRetries {
+				return nil, fmt.Errorf("introdb: server error %d after %d retries", resp.StatusCode, maxRetries)
 			}
-			return nil, fmt.Errorf("introdb: server error %d after %d retries", resp.StatusCode, maxRetries)
+			backoff := time.Duration(1<<attempt) * time.Second
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			continue
+		}
+
+		if resp.StatusCode == http.StatusForbidden && !isJSONResponse(resp) {
+			_ = resp.Body.Close()
+			return nil, cloudflareBlockError(resp)
 		}
 
 		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusForbidden &&
-				(strings.EqualFold(resp.Header.Get("Server"), "cloudflare") || bytes.Contains(bytes.ToLower(body), []byte("cloudflare"))) {
-				c.pauseBlockedRequests(defaultBlockedCooldown)
-				ray := strings.TrimSpace(resp.Header.Get("CF-Ray"))
-				if ray != "" {
-					return nil, fmt.Errorf("introdb: Cloudflare blocked request (HTTP 403, cf-ray %s); paused requests for %s", ray, defaultBlockedCooldown)
-				}
-				return nil, fmt.Errorf("introdb: Cloudflare blocked request (HTTP 403); paused requests for %s", defaultBlockedCooldown)
-			}
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+			_ = resp.Body.Close()
 			return nil, fmt.Errorf("introdb: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 
 		var out mediaResponse
 		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(&out)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if decodeErr != nil {
 			return nil, fmt.Errorf("introdb: decode response: %w", decodeErr)
 		}
-		c.cache.Set(key, &out, c.responseCacheTTL(&out))
 		return &out, nil
 	}
-	return nil, fmt.Errorf("introdb: max retries exceeded")
 }
 
-func (c *Client) pauseBlockedRequests(cooldown time.Duration) {
-	c.mu.Lock()
-	until := time.Now().Add(cooldown)
-	if until.After(c.blockedUntil) {
-		c.blockedUntil = until
+// Every API response passes through Cloudflare, so the Server header cannot
+// distinguish a block from an origin error. The origin reports errors as JSON;
+// a Cloudflare block is an HTML page.
+func isJSONResponse(resp *http.Response) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type"))), "application/json")
+}
+
+// cloudflareBlockError asks the host to pause the provider instead of letting
+// every queued lookup reach the block. The HTML block page is dropped; the
+// CF-Ray value is enough to diagnose it.
+func cloudflareBlockError(resp *http.Response) error {
+	message := fmt.Sprintf("introdb: Cloudflare blocked request (HTTP 403); retry after %s", defaultBlockedCooldown)
+	if ray := strings.TrimSpace(resp.Header.Get("CF-Ray")); ray != "" {
+		message = fmt.Sprintf("introdb: Cloudflare blocked request (HTTP 403, cf-ray %s); retry after %s", ray, defaultBlockedCooldown)
 	}
-	c.mu.Unlock()
+	return &RetryAfterError{RetryAfter: defaultBlockedCooldown, Message: message}
 }
 
-func (c *Client) blockedCooldownRemaining() time.Duration {
-	c.mu.RLock()
-	remaining := time.Until(c.blockedUntil)
-	c.mu.RUnlock()
-	if remaining < 0 {
-		return 0
-	}
-	return remaining
-}
-
-func (c *Client) responseCacheTTL(response *mediaResponse) time.Duration {
+func responseCacheTTL(response *mediaResponse) time.Duration {
 	if response == nil || len(response.Intro) == 0 || len(response.Credits) == 0 {
-		return c.incompleteCacheTTL
+		return defaultIncompleteCacheTTL
 	}
-	return c.cacheTTL
-}
-
-func retryAfterOrDefault(resp *http.Response, attempt int) time.Duration {
-	if val := resp.Header.Get("Retry-After"); val != "" {
-		if secs, err := strconv.Atoi(val); err == nil && secs > 0 {
-			return time.Duration(secs) * time.Second
-		}
-	}
-	return time.Duration(1<<attempt) * time.Second
+	return defaultCacheTTL
 }
 
 // submitSegment contributes a single segment via POST /v3/submit. The API key
@@ -352,37 +272,23 @@ func (c *Client) submitSegment(ctx context.Context, body submitRequest) (*submit
 	if err != nil {
 		return nil, fmt.Errorf("introdb: marshal submit: %w", err)
 	}
-	if err := c.limiter.Wait(ctx); err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/submit", bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("introdb: create submit request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", clientUserAgent)
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(ctx, http.MethodPost, baseURL+"/submit", bytes.NewReader(payload), apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("introdb: submit request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		after := time.Duration(usageResetSeconds(resp)) * time.Second
-		return nil, &RetryAfterError{
-			RetryAfter: after,
-			Message:    fmt.Sprintf("introdb: submit usage-limited; retry after %s", after),
-		}
+		return nil, rateLimitError(resp)
 	}
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
 		return nil, fmt.Errorf("introdb: submit HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 
+	// Submissions affect authenticated lookups immediately. Replacing the cache
+	// prevents an older in-flight fetch from repopulating it with stale data.
+	c.invalidateCache()
 	var out submitResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(&out); err != nil {
 		return nil, fmt.Errorf("introdb: decode submit response: %w", err)
@@ -400,24 +306,15 @@ func (c *Client) fetchUserStats(ctx context.Context) (*userStatsResponse, error)
 	if apiKey == "" {
 		return nil, fmt.Errorf("introdb: user stats require an API key")
 	}
-	if err := c.limiter.Wait(ctx); err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/user/stats", nil)
-	if err != nil {
-		return nil, fmt.Errorf("introdb: create stats request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", clientUserAgent)
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(ctx, http.MethodGet, baseURL+"/user/stats", nil, apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("introdb: stats request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, rateLimitError(resp)
+	}
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
 		return nil, fmt.Errorf("introdb: stats HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
@@ -433,14 +330,53 @@ func (c *Client) fetchUserStats(ctx context.Context) (*userStatsResponse, error)
 	return &out, nil
 }
 
-// usageResetSeconds reads the usage/rate reset hint from a 429 response.
-func usageResetSeconds(resp *http.Response) int {
-	for _, h := range []string{"X-UsageLimit-Reset", "X-RateLimit-Reset", "Retry-After"} {
-		if v := resp.Header.Get(h); v != "" {
-			if s, err := strconv.Atoi(v); err == nil && s > 0 {
-				return s
-			}
-		}
+func (c *Client) do(ctx context.Context, method, endpoint string, body io.Reader, apiKey string) (*http.Response, error) {
+	if err := c.limiter.Wait(ctx); err != nil {
+		return nil, err
 	}
-	return 0
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", clientUserAgent)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	return c.httpClient.Do(req)
+}
+
+func rateLimitError(resp *http.Response) error {
+	after := retryDelay(resp.Header, time.Now())
+	return &RetryAfterError{RetryAfter: after, Message: fmt.Sprintf("introdb: rate or usage limited; retry after %s", after)}
+}
+
+// Daily usage headers accompany successful requests too. Only honor a reset
+// for an exhausted quota, or when the response omits its remaining count.
+func retryDelay(headers http.Header, now time.Time) time.Duration {
+	after := retrySeconds(headers.Get("Retry-After"))
+	if date, err := http.ParseTime(headers.Get("Retry-After")); err == nil {
+		after = max(after, date.Sub(now))
+	}
+	for _, prefix := range []string{"X-UsageLimit-", "X-RateLimit-"} {
+		if remaining, err := strconv.ParseInt(headers.Get(prefix+"Remaining"), 10, 64); err == nil && remaining > 0 {
+			continue
+		}
+		after = max(after, retrySeconds(headers.Get(prefix+"Reset")))
+	}
+	if after <= 0 {
+		return 10 * time.Second
+	}
+	return after
+}
+
+func retrySeconds(value string) time.Duration {
+	seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || seconds <= 0 || seconds > int64(1<<63-1)/int64(time.Second) {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }

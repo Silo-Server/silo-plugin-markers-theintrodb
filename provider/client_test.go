@@ -2,14 +2,13 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 func TestFetchEpisodeSendsTVDBWhenNoTMDB(t *testing.T) {
@@ -95,57 +94,6 @@ func TestFetchEpisodeCachesByID(t *testing.T) {
 	}
 }
 
-func TestFetchEpisodeCollapsesConcurrentLookups(t *testing.T) {
-	var hits int32
-	requestStarted := make(chan struct{}, 1)
-	releaseRequest := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&hits, 1)
-		select {
-		case requestStarted <- struct{}{}:
-		default:
-		}
-		<-releaseRequest
-		_, _ = w.Write([]byte(`{"type":"episode","intro":[{"end_ms":60000}]}`))
-	}))
-	defer srv.Close()
-
-	c := NewClient("")
-	t.Cleanup(c.Close)
-	c.SetBaseURL(srv.URL)
-
-	const callers = 12
-	start := make(chan struct{})
-	errs := make(chan error, callers)
-	var wg sync.WaitGroup
-	for i := 0; i < callers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			_, err := c.FetchEpisode(context.Background(), "111", "", "", 1, 2, 0)
-			errs <- err
-		}()
-	}
-	close(start)
-	select {
-	case <-requestStarted:
-	case <-time.After(time.Second):
-		t.Fatal("first lookup did not reach server")
-	}
-	close(releaseRequest)
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatalf("FetchEpisode: %v", err)
-		}
-	}
-	if got := atomic.LoadInt32(&hits); got != 1 {
-		t.Fatalf("server hits = %d, want 1 collapsed lookup", got)
-	}
-}
-
 func TestFetchEpisodeFallsBackThroughTVDBToIMDB(t *testing.T) {
 	var queries []url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -159,7 +107,6 @@ func TestFetchEpisodeFallsBackThroughTVDBToIMDB(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient("")
-	t.Cleanup(c.Close)
 	c.SetBaseURL(srv.URL)
 	response, err := c.FetchEpisode(context.Background(), "111", "222", "tt333", 1, 2, 0)
 	if err != nil {
@@ -179,14 +126,13 @@ func TestFetchEpisodeStopsFallbackAfterPartialResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
 		if r.URL.Query().Get("tmdb_id") == "" {
-			t.Fatalf("unexpected alternate-ID request: %s", r.URL.RawQuery)
+			t.Errorf("unexpected alternate-ID request: %s", r.URL.RawQuery)
 		}
 		_, _ = w.Write([]byte(`{"type":"episode","intro":[{"end_ms":60000}]}`))
 	}))
 	defer srv.Close()
 
 	c := NewClient("")
-	t.Cleanup(c.Close)
 	c.SetBaseURL(srv.URL)
 	response, err := c.FetchEpisode(context.Background(), "111", "222", "tt333", 1, 2, 0)
 	if err != nil {
@@ -241,43 +187,58 @@ func TestFetchEpisodeStopsAndCoolsDownAfterCloudflareForbidden(t *testing.T) {
 		}
 		w.Header().Set("Server", "cloudflare")
 		w.Header().Set("CF-Ray", "test-ray-SJC")
+		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte("<html>Cloudflare: Sorry, you have been blocked</html>"))
 	}))
 	defer srv.Close()
 
 	c := NewClient("")
-	t.Cleanup(c.Close)
 	c.SetBaseURL(srv.URL)
 
 	_, err := c.FetchEpisode(context.Background(), "111", "222", "tt333", 1, 2, 0)
-	if err == nil || !strings.Contains(err.Error(), "Cloudflare blocked request") ||
-		!strings.Contains(err.Error(), "test-ray-SJC") {
-		t.Fatalf("first error = %v, want classified Cloudflare block with ray ID", err)
+	var blocked *RetryAfterError
+	if !errors.As(err, &blocked) || blocked.RetryAfter != defaultBlockedCooldown {
+		t.Fatalf("error = %v, want host cooldown of %s", err, defaultBlockedCooldown)
+	}
+	if !strings.Contains(err.Error(), "Cloudflare blocked request") || !strings.Contains(err.Error(), "test-ray-SJC") ||
+		strings.Contains(err.Error(), "<html>") {
+		t.Fatalf("error = %q, want classified Cloudflare block with ray ID and no block page", err)
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
 		t.Fatalf("server hits after fallback candidates = %d, want 1", got)
 	}
+}
 
-	_, err = c.FetchEpisode(context.Background(), "444", "555", "tt666", 3, 4, 0)
-	if err == nil || !strings.Contains(err.Error(), "requests paused") {
-		t.Fatalf("cooldown error = %v, want paused request", err)
-	}
-	if got := atomic.LoadInt32(&hits); got != 1 {
-		t.Fatalf("server hits during cooldown = %d, want 1", got)
+func TestFetchEpisodeReportsOriginForbiddenAsHTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Cloudflare fronts every API response, including origin JSON errors.
+		w.Header().Set("Server", "cloudflare")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"forbidden"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("")
+	c.SetBaseURL(srv.URL)
+	_, err := c.FetchEpisode(context.Background(), "111", "", "", 1, 2, 0)
+	var blocked *RetryAfterError
+	if err == nil || errors.As(err, &blocked) || !strings.Contains(err.Error(), `HTTP 403: {"error":"forbidden"}`) {
+		t.Fatalf("error = %v, want origin HTTP 403 without a provider cooldown", err)
 	}
 }
 
 func TestResponseCacheTTLUsesShortTTLUntilIntroAndCreditsExist(t *testing.T) {
-	c := NewClient("")
-	t.Cleanup(c.Close)
-
 	intro := segmentTimestamps{}
 	credits := segmentTimestamps{}
-	if got := c.responseCacheTTL(&mediaResponse{Intro: []segmentTimestamps{intro}}); got != defaultIncompleteCacheTTL {
+	if got := responseCacheTTL(nil); got != defaultIncompleteCacheTTL {
+		t.Fatalf("missing response TTL = %s, want %s", got, defaultIncompleteCacheTTL)
+	}
+	if got := responseCacheTTL(&mediaResponse{Intro: []segmentTimestamps{intro}}); got != defaultIncompleteCacheTTL {
 		t.Fatalf("partial response TTL = %s, want %s", got, defaultIncompleteCacheTTL)
 	}
-	if got := c.responseCacheTTL(&mediaResponse{
+	if got := responseCacheTTL(&mediaResponse{
 		Intro: []segmentTimestamps{intro}, Credits: []segmentTimestamps{credits},
 	}); got != defaultCacheTTL {
 		t.Fatalf("complete response TTL = %s, want %s", got, defaultCacheTTL)

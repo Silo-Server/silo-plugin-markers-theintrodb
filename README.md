@@ -1,9 +1,19 @@
-# Silo TheIntroDB Plugin
+# TheIntroDB Marker Plugin for Silo
 
 First-party Silo marker provider for [TheIntroDB](https://theintrodb.org).
 
 The plugin implements `marker_provider.v1` and can fetch or submit `intro`,
 `credits`, `recap`, and `preview` markers for movies and TV episodes.
+
+The manifest asks Silo for a TMDB external ID. The fetch implementation can
+address TheIntroDB with a TMDB, TVDB, or IMDb ID and works without an account;
+submissions specifically require a TMDB ID and API key. Account statistics also
+require an API key.
+
+Each returned segment is preserved, including separate credits ranges around a
+mid-credits scene. Lookup responses are cached for up to 24 hours in a bounded
+cache; changing credentials or submitting a marker clears that cache. Quota
+responses include the upstream reset delay so Silo can schedule the next lookup.
 
 ## Configuration
 
@@ -16,3 +26,14 @@ without a key; submissions and account statistics require one.
 GOWORK=off go test ./...
 make build
 ```
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Changes to
+the marker contract must be coordinated with `silo-plugin-sdk` and
+`silo-server`.
+
+## License
+
+`silo-plugin-markers-theintrodb` is licensed under `AGPL-3.0-only`. See
+[LICENSE](LICENSE).

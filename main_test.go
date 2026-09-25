@@ -11,8 +11,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/Silo-Server/silo-plugin-markers-introdb/provider"
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 )
 
 func testMarkerServer(t *testing.T, handler http.HandlerFunc, apiKey string) *markerServer {
@@ -21,18 +21,17 @@ func testMarkerServer(t *testing.T, handler http.HandlerFunc, apiKey string) *ma
 	t.Cleanup(srv.Close)
 	client := provider.NewClient(apiKey)
 	client.SetBaseURL(srv.URL)
-	t.Cleanup(client.Close)
 	return &markerServer{runtime: &runtimeServer{client: client, provider: provider.NewProvider(client)}}
 }
 
 func TestMarkerServerFetchMarkersMapsSegments(t *testing.T) {
 	server := testMarkerServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{
-			"type":"episode",
-			"intro":[{"end_ms":60000,"confidence":0.8,"submission_count":4}],
-			"credits":[{"start_ms":1500000,"confidence":0.7,"submission_count":3}],
-			"recap":[{"end_ms":45000,"confidence":0.6,"submission_count":2}],
-			"preview":[{"start_ms":300000,"end_ms":330000,"confidence":0.5,"submission_count":1}]
+			"tmdb_id":123,"type":"tv","season":1,"episode":2,
+			"intro":[{"start_ms":null,"end_ms":60000},{"start_ms":210000,"end_ms":250000}],
+			"credits":[{"start_ms":1450000,"end_ms":1500000},{"start_ms":1570000,"end_ms":null}],
+			"recap":[{"start_ms":null,"end_ms":45000}],
+			"preview":[{"start_ms":1350000,"end_ms":1400000}]
 		}`))
 	}, "")
 
@@ -48,15 +47,46 @@ func TestMarkerServerFetchMarkersMapsSegments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchMarkers: %v", err)
 	}
-	if len(resp.GetMarkers()) != 4 {
-		t.Fatalf("markers = %d, want 4", len(resp.GetMarkers()))
+	want := []struct {
+		segment string
+		start   float64
+		end     float64
+	}{
+		{"intro", 0, 60},
+		{"intro", 210, 250},
+		{"credits", 1450, 1500},
+		{"credits", 1570, 1800},
+		{"recap", 0, 45},
+		{"preview", 1350, 1400},
 	}
-	got := resp.GetMarkers()[0]
-	if got.GetSegment() != "intro" || got.GetEndSeconds() != 60 || got.GetConfidence() != 0.8 || got.GetSubmissionCount() != 4 {
-		t.Fatalf("intro marker = %+v", got)
+	if len(resp.GetMarkers()) != len(want) {
+		t.Fatalf("markers = %d, want %d", len(resp.GetMarkers()), len(want))
 	}
-	if got.GetAlgorithm() != provider.Algorithm {
-		t.Fatalf("algorithm = %q, want %q", got.GetAlgorithm(), provider.Algorithm)
+	for i, expected := range want {
+		got := resp.GetMarkers()[i]
+		if got.GetSegment() != expected.segment || got.StartSeconds == nil || got.EndSeconds == nil || got.GetStartSeconds() != expected.start || got.GetEndSeconds() != expected.end {
+			t.Errorf("marker %d = %+v, want %s %v–%v", i, got, expected.segment, expected.start, expected.end)
+		}
+		if got.GetConfidence() != 0.9 || got.GetSubmissionCount() != 0 || got.GetAlgorithm() != provider.Algorithm {
+			t.Errorf("marker %d metadata = %+v, want default confidence, no submission count, and %q", i, got, provider.Algorithm)
+		}
+	}
+}
+
+func TestMarkerServerFetchMarkersWithEmptyArrays(t *testing.T) {
+	server := testMarkerServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"tmdb_id":123,"type":"movie","intro":null,"credits":[],"recap":null}`))
+	}, "")
+	resp, err := server.FetchMarkers(context.Background(), &pluginv1.FetchMarkersRequest{
+		ItemType:        "movie",
+		ExternalIds:     &pluginv1.MarkerExternalIDs{TmdbId: "123"},
+		DurationSeconds: 1800,
+	})
+	if err != nil {
+		t.Fatalf("FetchMarkers: %v", err)
+	}
+	if len(resp.GetMarkers()) != 0 {
+		t.Fatalf("markers = %+v, want none", resp.GetMarkers())
 	}
 }
 
