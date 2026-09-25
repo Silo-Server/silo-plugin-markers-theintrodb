@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.theintrodb",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "presentation": {
@@ -37,7 +37,9 @@
       "display_name": "TheIntroDB",
       "description": "Fetches and submits intro, credits, recap, and preview markers using TheIntroDB.",
       "metadata": {
-        "required_external_ids": ["tmdb"],
+        "required_external_ids": [
+          "tmdb"
+        ],
         "default_fetch_priority": 100
       }
     }
