@@ -169,17 +169,17 @@ func (c *Client) fetchMedia(ctx context.Context, reqURL, apiKey string) (*mediaR
 		}
 
 		if resp.StatusCode == http.StatusNotFound {
-			_ = resp.Body.Close()
+			closeResponse(resp)
 			return nil, nil
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
-			_ = resp.Body.Close()
+			closeResponse(resp)
 			return nil, rateLimitError(resp)
 		}
 
 		if resp.StatusCode >= 500 {
-			_ = resp.Body.Close()
+			closeResponse(resp)
 			if attempt == maxRetries {
 				return nil, fmt.Errorf("introdb: server error %d after %d retries", resp.StatusCode, maxRetries)
 			}
@@ -194,18 +194,30 @@ func (c *Client) fetchMedia(ctx context.Context, reqURL, apiKey string) (*mediaR
 
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
-			_ = resp.Body.Close()
+			closeResponse(resp)
 			return nil, fmt.Errorf("introdb: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 
 		var out mediaResponse
 		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(&out)
-		_ = resp.Body.Close()
+		closeResponse(resp)
 		if decodeErr != nil {
 			return nil, fmt.Errorf("introdb: decode response: %w", decodeErr)
 		}
 		return &out, nil
 	}
+}
+
+// closeResponse releases a response body that the caller is not returning. The
+// status branches report the upstream status rather than a read failure, so the
+// close error has nowhere to go; draining a bounded amount first keeps the
+// connection reusable instead of forcing the transport to drop it.
+func closeResponse(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBody))
+	_ = resp.Body.Close()
 }
 
 // submitSegment contributes a single segment via POST /v3/submit. The API key
@@ -229,7 +241,7 @@ func (c *Client) submitSegment(ctx context.Context, body submitRequest) (*submit
 	if err != nil {
 		return nil, fmt.Errorf("introdb: submit request failed: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer closeResponse(resp)
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return nil, rateLimitError(resp)
@@ -263,7 +275,7 @@ func (c *Client) fetchUserStats(ctx context.Context) (*userStatsResponse, error)
 	if err != nil {
 		return nil, fmt.Errorf("introdb: stats request failed: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer closeResponse(resp)
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return nil, rateLimitError(resp)
