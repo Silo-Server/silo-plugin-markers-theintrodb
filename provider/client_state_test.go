@@ -30,12 +30,12 @@ func TestFetchSharesConcurrentWorkAcrossCancellation(t *testing.T) {
 		client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
 			hits.Add(1)
 			<-release
-			return jsonResponse(http.StatusOK, `{"tmdb_id":123,"type":"movie"}`), nil
+			return jsonResponse(http.StatusOK, `{"tvdb_id":123,"type":"movie"}`), nil
 		})
 		ctx, cancel := context.WithCancel(t.Context())
 		canceled := make(chan error, 1)
 		go func() {
-			_, err := client.FetchMovie(ctx, "123", "", "", 0)
+			_, err := client.FetchMovie(ctx, idTarget(ItemKindMovie, "123", "", ""), 0)
 			canceled <- err
 		}()
 		synctest.Wait()
@@ -43,7 +43,7 @@ func TestFetchSharesConcurrentWorkAcrossCancellation(t *testing.T) {
 		results := make(chan error, waiters)
 		for range waiters {
 			go func() {
-				_, err := client.FetchMovie(t.Context(), "123", "", "", 0)
+				_, err := client.FetchMovie(t.Context(), idTarget(ItemKindMovie, "123", "", ""), 0)
 				results <- err
 			}()
 		}
@@ -74,38 +74,38 @@ func TestCredentialChangeIsolatesInFlightAndCachedResponses(t *testing.T) {
 			switch req.Header.Get("Authorization") {
 			case "Bearer old-key":
 				<-release
-				return jsonResponse(http.StatusOK, `{"tmdb_id":1}`), nil
+				return jsonResponse(http.StatusOK, `{"tvdb_id":1}`), nil
 			case "Bearer new-key":
-				return jsonResponse(http.StatusOK, `{"tmdb_id":2}`), nil
+				return jsonResponse(http.StatusOK, `{"tvdb_id":2}`), nil
 			default:
 				return jsonResponse(http.StatusNotFound, `{}`), nil
 			}
 		})
 		oldDone := make(chan error, 1)
 		go func() {
-			_, err := client.FetchMovie(t.Context(), "123", "", "", 0)
+			_, err := client.FetchMovie(t.Context(), idTarget(ItemKindMovie, "123", "", ""), 0)
 			oldDone <- err
 		}()
 		synctest.Wait()
 		client.SetAPIKey("new-key")
-		response, err := client.FetchMovie(t.Context(), "123", "", "", 0)
-		if err != nil || response == nil || response.TmdbID != 2 {
+		response, err := client.FetchMovie(t.Context(), idTarget(ItemKindMovie, "123", "", ""), 0)
+		if err != nil || response == nil || response.TvdbID != 2 {
 			t.Fatalf("new credential fetch = %+v, %v", response, err)
 		}
 		close(release)
 		if err := <-oldDone; err != nil {
 			t.Fatal(err)
 		}
-		response, err = client.FetchMovie(t.Context(), "123", "", "", 0)
-		if err != nil || response == nil || response.TmdbID != 2 || hits.Load() != 2 {
+		response, err = client.FetchMovie(t.Context(), idTarget(ItemKindMovie, "123", "", ""), 0)
+		if err != nil || response == nil || response.TvdbID != 2 || hits.Load() != 2 {
 			t.Fatalf("old response changed new cache: response=%+v error=%v hits=%d", response, err, hits.Load())
 		}
 		client.SetAPIKey("")
-		if response, err := client.FetchMovie(t.Context(), "123", "", "", 0); err != nil || response != nil {
+		if response, err := client.FetchMovie(t.Context(), idTarget(ItemKindMovie, "123", "", ""), 0); err != nil || response != nil {
 			t.Fatalf("anonymous fetch retained authenticated result: %+v, %v", response, err)
 		}
 		client.SetAPIKey("new-key")
-		if response, err := client.FetchMovie(t.Context(), "123", "", "", 0); err != nil || response == nil {
+		if response, err := client.FetchMovie(t.Context(), idTarget(ItemKindMovie, "123", "", ""), 0); err != nil || response == nil {
 			t.Fatalf("authenticated fetch retained anonymous negative: %+v, %v", response, err)
 		}
 	})
@@ -115,22 +115,22 @@ func TestSubmissionInvalidatesNegativeLookup(t *testing.T) {
 	client := NewClient("test-key")
 	var submitted atomic.Bool
 	client.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.Path == "/v3/submit" {
+		if req.URL.Path == "/v4/submit" {
 			submitted.Store(true)
 			return jsonResponse(http.StatusOK, `{"submissions":[{"id":"123","status":"pending"}]}`), nil
 		}
 		if submitted.Load() {
-			return jsonResponse(http.StatusOK, `{"tmdb_id":123,"intro":[{"end_ms":60000}]}`), nil
+			return jsonResponse(http.StatusOK, `{"tvdb_id":123,"intro":[{"end_ms":60000}]}`), nil
 		}
 		return jsonResponse(http.StatusNotFound, `{}`), nil
 	})
-	if result, err := client.FetchMovie(t.Context(), "123", "", "", 0); err != nil || result != nil {
+	if result, err := client.FetchMovie(t.Context(), idTarget(ItemKindMovie, "123", "", ""), 0); err != nil || result != nil {
 		t.Fatalf("initial result = %+v, %v", result, err)
 	}
-	if _, err := client.submitSegment(t.Context(), submitRequest{TmdbID: 123, Type: "movie", Segment: "intro"}); err != nil {
+	if _, err := client.submitSegment(t.Context(), submitRequest{TvdbID: new(int64(123)), Type: "movie", Segment: "intro"}); err != nil {
 		t.Fatal(err)
 	}
-	if result, err := client.FetchMovie(t.Context(), "123", "", "", 0); err != nil || result == nil || len(result.Intro) != 1 {
+	if result, err := client.FetchMovie(t.Context(), idTarget(ItemKindMovie, "123", "", ""), 0); err != nil || result == nil || len(result.Intro) != 1 {
 		t.Fatalf("result after submission = %+v, %v", result, err)
 	}
 }
@@ -144,7 +144,7 @@ func TestFetchReturnsQuotaResetWithoutRetry(t *testing.T) {
 		response.Header.Set("X-UsageLimit-Reset", "86400")
 		return response, nil
 	})
-	_, err := client.FetchMovie(t.Context(), "123", "", "", 0)
+	_, err := client.FetchMovie(t.Context(), idTarget(ItemKindMovie, "123", "", ""), 0)
 	var quota *RetryAfterError
 	if !errors.As(err, &quota) || quota.RetryAfter != 24*time.Hour || hits.Load() != 1 {
 		t.Fatalf("error=%v quota=%+v HTTP requests=%d", err, quota, hits.Load())
@@ -154,16 +154,16 @@ func TestFetchReturnsQuotaResetWithoutRetry(t *testing.T) {
 func TestFetchRetriesUseRateLimiter(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		client := NewClient("")
-		client.limiter = rate.NewLimiter(rate.Every(5*time.Second), 1)
+		client.lookupLimiter = rate.NewLimiter(rate.Every(5*time.Second), 1)
 		var requested []time.Time
 		client.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
 			requested = append(requested, time.Now())
 			if len(requested) == 1 {
 				return jsonResponse(http.StatusServiceUnavailable, `{}`), nil
 			}
-			return jsonResponse(http.StatusOK, `{"tmdb_id":123}`), nil
+			return jsonResponse(http.StatusOK, `{"tvdb_id":123}`), nil
 		})
-		if _, err := client.FetchMovie(t.Context(), "123", "", "", 0); err != nil {
+		if _, err := client.FetchMovie(t.Context(), idTarget(ItemKindMovie, "123", "", ""), 0); err != nil {
 			t.Fatal(err)
 		}
 		if len(requested) != 2 || requested[1].Sub(requested[0]) < 5*time.Second {

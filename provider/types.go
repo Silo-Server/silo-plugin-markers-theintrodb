@@ -2,6 +2,7 @@
 package provider
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
@@ -11,17 +12,16 @@ import (
 const ProviderID = "introdb"
 
 // Algorithm is the algorithm tag written alongside markers. The version
-// suffix lets us invalidate or refresh markers if the upstream contract
-// changes.
-const Algorithm = "introdb:v3"
+// suffix names the upstream API contract the markers came from.
+const Algorithm = "introdb:v4"
 
-// defaultConfidence is Silo's confidence policy for this provider. TheIntroDB
-// does not publish per-segment confidence or submission counts.
+// defaultConfidence stands in when a response omits TheIntroDB's own
+// per-segment confidence.
 const defaultConfidence = 0.9
 
-// DefaultBaseURL is the production TheIntroDB v3 endpoint. Overridable
+// DefaultBaseURL is the production TheIntroDB v4 endpoint. Overridable
 // in tests via Client.SetBaseURL.
-const DefaultBaseURL = "https://api.theintrodb.org/v3"
+const DefaultBaseURL = "https://api.theintrodb.org/v4"
 
 const (
 	ExternalIDKeyTMDB = "tmdb"
@@ -45,12 +45,17 @@ const (
 	MarkerKindPreview
 )
 
+// Request describes one item to look up. For an episode, ExternalIDs names
+// the series and EpisodeExternalIDs the episode record Silo matched at
+// SeasonNumber/EpisodeNumber; season 0 holds specials.
 type Request struct {
-	Kind          ItemKind
-	ExternalIDs   map[string]string
-	SeasonNumber  int
-	EpisodeNumber int
-	Duration      time.Duration
+	Kind               ItemKind
+	ExternalIDs        map[string]string
+	SeasonNumber       int
+	EpisodeNumber      int
+	EpisodeExternalIDs map[string]string
+	EpisodeTitle       string
+	Duration           time.Duration
 }
 
 type Result struct {
@@ -58,22 +63,27 @@ type Result struct {
 }
 
 type Marker struct {
-	Kind       MarkerKind
-	Start      time.Duration
-	End        time.Duration
-	Confidence float64
-	Algorithm  string
+	Kind            MarkerKind
+	Start           time.Duration
+	End             time.Duration
+	Confidence      float64
+	SubmissionCount int
+	Algorithm       string
 }
 
+// SubmissionRequest describes one segment to contribute. The item fields
+// follow Request.
 type SubmissionRequest struct {
-	Kind          ItemKind
-	ExternalIDs   map[string]string
-	SeasonNumber  int
-	EpisodeNumber int
-	Segment       MarkerKind
-	Start         *time.Duration
-	End           *time.Duration
-	Duration      time.Duration
+	Kind               ItemKind
+	ExternalIDs        map[string]string
+	SeasonNumber       int
+	EpisodeNumber      int
+	EpisodeExternalIDs map[string]string
+	EpisodeTitle       string
+	Segment            MarkerKind
+	Start              *time.Duration
+	End                *time.Duration
+	Duration           time.Duration
 }
 
 const (
@@ -98,6 +108,10 @@ type UserStats struct {
 	BestStreak     int
 }
 
+// ErrUnsubmittable marks a submission TheIntroDB cannot accept however often
+// it is retried, such as an item without a usable ID.
+var ErrUnsubmittable = errors.New("introdb: unsubmittable")
+
 type RetryAfterError struct {
 	RetryAfter time.Duration
 	Message    string
@@ -113,11 +127,12 @@ func (e *RetryAfterError) Error() string {
 	return fmt.Sprintf("retry after %s", e.RetryAfter)
 }
 
-// mediaResponse mirrors the JSON shape returned by GET /v3/media.
-// Each segment kind is an array of zero or more entries; absent fields
-// are decoded as empty slices via Go's zero-value semantics.
+// mediaResponse mirrors the JSON shape returned by GET /v4/media. Each
+// segment kind is an array of zero or more entries; absent fields are decoded
+// as empty slices via Go's zero-value semantics. The episode-list fallback
+// TheIntroDB sends for media without submissions decodes to no segments.
 type mediaResponse struct {
-	TmdbID  int                 `json:"tmdb_id"`
+	TvdbID  int                 `json:"tvdb_id"`
 	Type    string              `json:"type"`
 	Season  *int                `json:"season,omitempty"`
 	Episode *int                `json:"episode,omitempty"`
@@ -130,29 +145,37 @@ type mediaResponse struct {
 // segmentTimestamps is the per-occurrence shape returned by TheIntroDB.
 // Either bound may be nil — for intro/recap, start may be omitted (segment
 // begins at file start); for credits/preview, end may be omitted (segment
-// runs to file end).
+// runs to file end). Confidence and SubmissionCount are present because
+// lookups ask for details.
 type segmentTimestamps struct {
-	StartMs *int64 `json:"start_ms,omitempty"`
-	EndMs   *int64 `json:"end_ms,omitempty"`
+	StartMs         *int64   `json:"start_ms,omitempty"`
+	EndMs           *int64   `json:"end_ms,omitempty"`
+	Confidence      *float64 `json:"confidence,omitempty"`
+	SubmissionCount *int     `json:"submission_count,omitempty"`
 }
 
-// submitRequest is the POST /v3/submit body. tmdb_id is required; start_ms and
-// end_ms are sent as explicit null (no omitempty) when the segment begins at
-// the start (intro/recap) or runs to the end (credits/preview).
+// submitRequest is the POST /v4/submit body. Exactly one of TvdbID, TmdbID and
+// ImdbID is set (see Target). start_ms and end_ms are sent as explicit null
+// (no omitempty) when the segment begins at the start (intro/recap) or runs to
+// the end (credits/preview).
 type submitRequest struct {
-	TmdbID          int    `json:"tmdb_id"`
+	TvdbID          *int64 `json:"tvdb_id,omitempty"`
+	TmdbID          *int64 `json:"tmdb_id,omitempty"`
 	ImdbID          string `json:"imdb_id,omitempty"`
 	Type            string `json:"type"`
 	Segment         string `json:"segment"`
 	Season          *int   `json:"season,omitempty"`
 	Episode         *int   `json:"episode,omitempty"`
+	TvdbEpisodeID   *int64 `json:"tvdb_episode_id,omitempty"`
+	EpisodeName     string `json:"episode_name,omitempty"`
 	VideoDurationMs *int64 `json:"video_duration_ms,omitempty"`
 	StartMs         *int64 `json:"start_ms"`
 	EndMs           *int64 `json:"end_ms"`
 }
 
-// submitResponse mirrors the POST /v3/submit success body.
+// submitResponse mirrors the POST /v4/submit success body.
 type submitResponse struct {
+	OK          bool               `json:"ok"`
 	Submissions []submissionRecord `json:"submissions"`
 }
 
@@ -162,7 +185,7 @@ type submissionRecord struct {
 	Weight float64 `json:"weight"`
 }
 
-// userStatsResponse mirrors GET /v3/user/stats. A non-empty Error (or a non-2xx
+// userStatsResponse mirrors GET /v4/user/stats. A non-empty Error (or a non-2xx
 // status) means the key is invalid.
 type userStatsResponse struct {
 	Total          int     `json:"total"`

@@ -23,7 +23,7 @@ func TestFetchEpisodeSendsTVDBWhenNoTMDB(t *testing.T) {
 
 	c := NewClient("")
 	c.SetBaseURL(srv.URL)
-	if _, err := c.FetchEpisode(context.Background(), "", "55555", "tt1234567", 2, 3, 0); err != nil {
+	if _, err := c.FetchEpisode(context.Background(), idTarget(ItemKindEpisode, "", "55555", "tt1234567"), 2, 3, 0); err != nil {
 		t.Fatalf("FetchEpisode: %v", err)
 	}
 	if gotQuery.Get("tvdb_id") != "55555" {
@@ -47,7 +47,7 @@ func TestFetchEpisodePrefersTMDBOverTVDBAndIMDB(t *testing.T) {
 
 	c := NewClient("")
 	c.SetBaseURL(srv.URL)
-	if _, err := c.FetchEpisode(context.Background(), "111", "222", "tt333", 1, 1, 0); err != nil {
+	if _, err := c.FetchEpisode(context.Background(), idTarget(ItemKindEpisode, "111", "222", "tt333"), 1, 1, 0); err != nil {
 		t.Fatalf("FetchEpisode: %v", err)
 	}
 	if gotQuery.Get("tmdb_id") != "111" {
@@ -68,7 +68,7 @@ func TestFetchMovieSendsTVDB(t *testing.T) {
 
 	c := NewClient("")
 	c.SetBaseURL(srv.URL)
-	if _, err := c.FetchMovie(context.Background(), "", "888", "", 0); err != nil {
+	if _, err := c.FetchMovie(context.Background(), idTarget(ItemKindMovie, "", "888", ""), 0); err != nil {
 		t.Fatalf("FetchMovie: %v", err)
 	}
 	if gotQuery.Get("tvdb_id") != "888" {
@@ -87,7 +87,7 @@ func TestFetchEpisodeCachesByID(t *testing.T) {
 	c := NewClient("")
 	c.SetBaseURL(srv.URL)
 	for i := 0; i < 3; i++ {
-		if _, err := c.FetchEpisode(context.Background(), "", "999", "", 1, 1, 0); err != nil {
+		if _, err := c.FetchEpisode(context.Background(), idTarget(ItemKindEpisode, "", "999", ""), 1, 1, 0); err != nil {
 			t.Fatalf("FetchEpisode: %v", err)
 		}
 	}
@@ -109,7 +109,7 @@ func TestFetchEpisodePartialResponseCostsOneRequest(t *testing.T) {
 
 	c := NewClient("")
 	c.SetBaseURL(srv.URL)
-	response, err := c.FetchEpisode(context.Background(), "111", "222", "tt333", 1, 2, 0)
+	response, err := c.FetchEpisode(context.Background(), idTarget(ItemKindEpisode, "111", "222", "tt333"), 1, 2, 0)
 	if err != nil {
 		t.Fatalf("FetchEpisode: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestFetchEpisodeMissCostsOneRequest(t *testing.T) {
 
 	c := NewClient("")
 	c.SetBaseURL(srv.URL)
-	response, err := c.FetchEpisode(context.Background(), "111", "222", "tt333", 1, 2, 0)
+	response, err := c.FetchEpisode(context.Background(), idTarget(ItemKindEpisode, "111", "222", "tt333"), 1, 2, 0)
 	if err != nil {
 		t.Fatalf("FetchEpisode: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestFetchEpisodeStopsAndCoolsDownAfterCloudflareForbidden(t *testing.T) {
 	c := NewClient("")
 	c.SetBaseURL(srv.URL)
 
-	_, err := c.FetchEpisode(context.Background(), "111", "222", "tt333", 1, 2, 0)
+	_, err := c.FetchEpisode(context.Background(), idTarget(ItemKindEpisode, "111", "222", "tt333"), 1, 2, 0)
 	var blocked *RetryAfterError
 	if !errors.As(err, &blocked) || blocked.RetryAfter != defaultBlockedCooldown {
 		t.Fatalf("error = %v, want host cooldown of %s", err, defaultBlockedCooldown)
@@ -190,7 +190,7 @@ func TestFetchEpisodeReportsNonCloudflareForbiddenAsHTTPError(t *testing.T) {
 
 	c := NewClient("")
 	c.SetBaseURL(srv.URL)
-	_, err := c.FetchEpisode(context.Background(), "111", "", "", 1, 2, 0)
+	_, err := c.FetchEpisode(context.Background(), idTarget(ItemKindEpisode, "111", "", ""), 1, 2, 0)
 	var blocked *RetryAfterError
 	if err == nil || errors.As(err, &blocked) || !strings.Contains(err.Error(), "HTTP 403: forbidden by proxy") {
 		t.Fatalf("error = %v, want plain HTTP 403 without a provider cooldown", err)
@@ -209,7 +209,7 @@ func TestFetchEpisodeReportsOriginForbiddenAsHTTPError(t *testing.T) {
 
 	c := NewClient("")
 	c.SetBaseURL(srv.URL)
-	_, err := c.FetchEpisode(context.Background(), "111", "", "", 1, 2, 0)
+	_, err := c.FetchEpisode(context.Background(), idTarget(ItemKindEpisode, "111", "", ""), 1, 2, 0)
 	var blocked *RetryAfterError
 	if err == nil || errors.As(err, &blocked) || !strings.Contains(err.Error(), `HTTP 403: {"error":"forbidden"}`) {
 		t.Fatalf("error = %v, want origin HTTP 403 without a provider cooldown", err)
@@ -292,5 +292,85 @@ func TestIsJSONResponseParsesTheMediaType(t *testing.T) {
 		if got := isJSONResponse(resp); got != want {
 			t.Errorf("isJSONResponse(%q) = %v, want %v", contentType, got, want)
 		}
+	}
+}
+
+// idTarget addresses an item by series or movie IDs alone, as a host without
+// episode IDs would.
+func idTarget(kind ItemKind, tmdbID, tvdbID, imdbID string) Target {
+	target, _ := NewTarget(kind, map[string]string{
+		ExternalIDKeyTMDB: tmdbID, ExternalIDKeyTVDB: tvdbID, ExternalIDKeyIMDB: imdbID,
+	}, nil, "")
+	return target
+}
+
+func TestFetchEpisodeSendsV4Parameters(t *testing.T) {
+	var gotPath string
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.Path, r.URL.Query()
+		_, _ = w.Write([]byte(`{"tvdb_id":121361,"type":"tv","season":0,"episode":4}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("")
+	c.SetBaseURL(srv.URL)
+	target, _ := NewTarget(ItemKindEpisode,
+		map[string]string{ExternalIDKeyTMDB: "1399", ExternalIDKeyTVDB: "121361"},
+		map[string]string{ExternalIDKeyTVDB: "4271129"}, "A Special")
+	response, err := c.FetchEpisode(context.Background(), target, 0, 4, 3_600_000)
+	if err != nil {
+		t.Fatalf("FetchEpisode: %v", err)
+	}
+	if response.TvdbID != 121361 {
+		t.Fatalf("response tvdb_id = %d", response.TvdbID)
+	}
+	want := url.Values{
+		"tvdb_id": {"121361"}, "tvdb_episode_id": {"4271129"}, "episode_name": {"A Special"},
+		"season": {"0"}, "episode": {"4"}, "duration_ms": {"3600000"}, "details": {"true"},
+	}
+	if gotPath != "/media" || gotQuery.Encode() != want.Encode() {
+		t.Fatalf("request = %s?%s, want /media?%s", gotPath, gotQuery.Encode(), want.Encode())
+	}
+}
+
+func TestFetchSpecificMediaLimitDoesNotPauseProvider(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "3600")
+		w.Header().Set("X-UsageLimit-Remaining", "4000")
+		w.Header().Set("X-UsageLimit-SpecificMedia-Remaining", "0")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"Usage limit exceeded","code":"specific_media_usage_limit_exceeded"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("")
+	c.SetBaseURL(srv.URL)
+	_, err := c.FetchMovie(context.Background(), idTarget(ItemKindMovie, "603", "", ""), 0)
+	var retryErr *RetryAfterError
+	if err == nil || errors.As(err, &retryErr) {
+		t.Fatalf("error = %T %v, want an ordinary per-item failure", err, err)
+	}
+	if !strings.Contains(err.Error(), "1h0m0s") {
+		t.Fatalf("error %q does not report the reset", err)
+	}
+}
+
+func TestAPIKeyRaisesLookupBudget(t *testing.T) {
+	c := NewClient("")
+	if c.lookupLimiter.Limit() != anonymousLookupRate || c.lookupLimiter.Burst() != anonymousLookupBurst {
+		t.Fatalf("anonymous limiter = %v/%d", c.lookupLimiter.Limit(), c.lookupLimiter.Burst())
+	}
+	c.SetAPIKey("secret-key")
+	if c.lookupLimiter.Limit() != keyedLookupRate || c.lookupLimiter.Burst() != keyedLookupBurst {
+		t.Fatalf("keyed limiter = %v/%d", c.lookupLimiter.Limit(), c.lookupLimiter.Burst())
+	}
+	if c.writeLimiter.Limit() != writeRate {
+		t.Fatalf("write limiter = %v, want unchanged %v", c.writeLimiter.Limit(), writeRate)
+	}
+	c.SetAPIKey("")
+	if c.lookupLimiter.Limit() != anonymousLookupRate {
+		t.Fatalf("limiter after removing the key = %v", c.lookupLimiter.Limit())
 	}
 }

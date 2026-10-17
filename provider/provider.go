@@ -3,8 +3,6 @@ package provider
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 )
 
@@ -29,10 +27,8 @@ func (p *Provider) FetchMarkers(ctx context.Context, req Request) (Result, error
 		return Result{}, nil
 	}
 
-	tmdbID := strings.TrimSpace(req.ExternalIDs[ExternalIDKeyTMDB])
-	tvdbID := strings.TrimSpace(req.ExternalIDs[ExternalIDKeyTVDB])
-	imdbID := strings.TrimSpace(req.ExternalIDs[ExternalIDKeyIMDB])
-	if tmdbID == "" && tvdbID == "" && imdbID == "" {
+	target, ok := NewTarget(req.Kind, req.ExternalIDs, req.EpisodeExternalIDs, req.EpisodeTitle)
+	if !ok {
 		return Result{}, nil
 	}
 
@@ -42,12 +38,12 @@ func (p *Provider) FetchMarkers(ctx context.Context, req Request) (Result, error
 	var err error
 	switch req.Kind {
 	case ItemKindEpisode:
-		if req.SeasonNumber <= 0 || req.EpisodeNumber <= 0 {
+		if !validCoordinates(req.SeasonNumber, req.EpisodeNumber) {
 			return Result{}, nil
 		}
-		resp, err = p.client.FetchEpisode(ctx, tmdbID, tvdbID, imdbID, req.SeasonNumber, req.EpisodeNumber, durationMS)
+		resp, err = p.client.FetchEpisode(ctx, target, req.SeasonNumber, req.EpisodeNumber, durationMS)
 	case ItemKindMovie:
-		resp, err = p.client.FetchMovie(ctx, tmdbID, tvdbID, imdbID, durationMS)
+		resp, err = p.client.FetchMovie(ctx, target, durationMS)
 	default:
 		return Result{}, nil
 	}
@@ -93,7 +89,14 @@ func convertMarkers(stamps []segmentTimestamps, kind MarkerKind, totalDuration t
 		if end <= start || (totalDuration > 0 && end > totalDuration) {
 			continue
 		}
-		markers = append(markers, Marker{Kind: kind, Start: start, End: end, Confidence: defaultConfidence, Algorithm: Algorithm})
+		marker := Marker{Kind: kind, Start: start, End: end, Confidence: defaultConfidence, Algorithm: Algorithm}
+		if s.Confidence != nil && *s.Confidence >= 0 && *s.Confidence <= 1 {
+			marker.Confidence = *s.Confidence
+		}
+		if s.SubmissionCount != nil && *s.SubmissionCount > 0 {
+			marker.SubmissionCount = *s.SubmissionCount
+		}
+		markers = append(markers, marker)
 	}
 	return markers
 }
@@ -103,32 +106,35 @@ func validTimestamp(ms *int64) bool {
 	return ms == nil || (*ms >= 0 && *ms <= maxMilliseconds)
 }
 
-// SubmitMarker contributes a single segment to TheIntroDB via POST /v3/submit.
-// A TMDB id is required (the submission endpoint is keyed on TMDB). Per the
+// TheIntroDB accepts a video duration from 5 minutes to 6 hours.
+const (
+	minSubmitVideoDuration = 5 * time.Minute
+	maxSubmitVideoDuration = 6 * time.Hour
+)
+
+// SubmitMarker contributes a single segment to TheIntroDB via POST /v4/submit,
+// addressing the item the same way a lookup does (see NewTarget). Per the
 // TheIntroDB convention, intro/recap submissions drop a zero start (= from the
 // beginning) and credits/preview drop an end at file duration (= to the end).
 func (p *Provider) SubmitMarker(ctx context.Context, req SubmissionRequest) (SubmissionResult, error) {
 	if p == nil || p.client == nil {
 		return SubmissionResult{}, fmt.Errorf("introdb: provider not configured")
 	}
-	tmdbID, err := strconv.Atoi(strings.TrimSpace(req.ExternalIDs[ExternalIDKeyTMDB]))
-	if err != nil || tmdbID <= 0 {
-		return SubmissionResult{}, fmt.Errorf("introdb: submit requires a TMDB id")
+	target, ok := NewTarget(req.Kind, req.ExternalIDs, req.EpisodeExternalIDs, req.EpisodeTitle)
+	if !ok {
+		return SubmissionResult{}, fmt.Errorf("%w: submit requires a TVDB, TMDB, or IMDb id", ErrUnsubmittable)
 	}
 	segment, err := segmentName(req.Segment)
 	if err != nil {
 		return SubmissionResult{}, err
 	}
 
-	body := submitRequest{
-		TmdbID:  tmdbID,
-		ImdbID:  strings.TrimSpace(req.ExternalIDs[ExternalIDKeyIMDB]),
-		Segment: segment,
-	}
+	body := submitRequest{Segment: segment}
+	target.applyTo(&body)
 	switch req.Kind {
 	case ItemKindEpisode:
-		if req.SeasonNumber <= 0 || req.EpisodeNumber <= 0 {
-			return SubmissionResult{}, fmt.Errorf("introdb: episode submit requires season and episode")
+		if !validCoordinates(req.SeasonNumber, req.EpisodeNumber) {
+			return SubmissionResult{}, fmt.Errorf("%w: season %d episode %d is outside TheIntroDB's range", ErrUnsubmittable, req.SeasonNumber, req.EpisodeNumber)
 		}
 		body.Type = "tv"
 		season, episode := req.SeasonNumber, req.EpisodeNumber
@@ -137,9 +143,9 @@ func (p *Provider) SubmitMarker(ctx context.Context, req SubmissionRequest) (Sub
 	case ItemKindMovie:
 		body.Type = "movie"
 	default:
-		return SubmissionResult{}, fmt.Errorf("introdb: unsupported item kind")
+		return SubmissionResult{}, fmt.Errorf("%w: unsupported item kind", ErrUnsubmittable)
 	}
-	if req.Duration > 0 {
+	if req.Duration >= minSubmitVideoDuration && req.Duration <= maxSubmitVideoDuration {
 		durMs := int64(req.Duration / time.Millisecond)
 		body.VideoDurationMs = &durMs
 	}
@@ -206,6 +212,6 @@ func segmentName(kind MarkerKind) (string, error) {
 	case MarkerKindPreview:
 		return "preview", nil
 	default:
-		return "", fmt.Errorf("introdb: unknown segment kind %d", kind)
+		return "", fmt.Errorf("%w: unknown segment kind %d", ErrUnsubmittable, kind)
 	}
 }

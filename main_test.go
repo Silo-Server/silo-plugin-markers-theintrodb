@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -27,7 +29,7 @@ func testMarkerServer(t *testing.T, handler http.HandlerFunc, apiKey string) *ma
 func TestMarkerServerFetchMarkersMapsSegments(t *testing.T) {
 	server := testMarkerServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{
-			"tmdb_id":123,"type":"tv","season":1,"episode":2,
+			"tvdb_id":123,"type":"tv","season":1,"episode":2,
 			"intro":[{"start_ms":null,"end_ms":60000},{"start_ms":210000,"end_ms":250000}],
 			"credits":[{"start_ms":1450000,"end_ms":1500000},{"start_ms":1570000,"end_ms":null}],
 			"recap":[{"start_ms":null,"end_ms":45000}],
@@ -75,7 +77,7 @@ func TestMarkerServerFetchMarkersMapsSegments(t *testing.T) {
 
 func TestMarkerServerFetchMarkersWithEmptyArrays(t *testing.T) {
 	server := testMarkerServer(t, func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"tmdb_id":123,"type":"movie","intro":null,"credits":[],"recap":null}`))
+		_, _ = w.Write([]byte(`{"tvdb_id":123,"type":"movie","intro":null,"credits":[],"recap":null}`))
 	}, "")
 	resp, err := server.FetchMarkers(context.Background(), &pluginv1.FetchMarkersRequest{
 		ItemType:        "movie",
@@ -147,3 +149,45 @@ func TestMarkerServerSubmitRateLimitMapsRetryInfo(t *testing.T) {
 }
 
 func floatPtr(v float64) *float64 { return &v }
+
+func TestMarkerServerPassesEpisodeIdentityAndDetails(t *testing.T) {
+	var gotQuery url.Values
+	server := testMarkerServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		_, _ = w.Write([]byte(`{"tvdb_id":121361,"type":"tv","season":1,"episode":1,
+			"intro":[{"start_ms":436000,"end_ms":535000,"confidence":0.67,"submission_count":5}]}`))
+	}, "")
+
+	resp, err := server.FetchMarkers(context.Background(), &pluginv1.FetchMarkersRequest{
+		ItemType:           "episode",
+		ExternalIds:        &pluginv1.MarkerExternalIDs{TmdbId: "1399", TvdbId: "121361"},
+		SeasonNumber:       1,
+		EpisodeNumber:      1,
+		DurationSeconds:    3695,
+		EpisodeExternalIds: &pluginv1.MarkerExternalIDs{TvdbId: "3254641"},
+		EpisodeTitle:       "Winter Is Coming",
+	})
+	if err != nil {
+		t.Fatalf("FetchMarkers: %v", err)
+	}
+	if gotQuery.Get("tvdb_id") != "121361" || gotQuery.Get("tmdb_id") != "" ||
+		gotQuery.Get("tvdb_episode_id") != "3254641" || gotQuery.Get("episode_name") != "Winter Is Coming" {
+		t.Fatalf("query = %s, want the TVDB-numbered episode addressed by TVDB", gotQuery.Encode())
+	}
+	if len(resp.GetMarkers()) != 1 {
+		t.Fatalf("markers = %+v", resp.GetMarkers())
+	}
+	if m := resp.GetMarkers()[0]; m.GetConfidence() != 0.67 || m.GetSubmissionCount() != 5 || m.GetAlgorithm() != provider.Algorithm {
+		t.Fatalf("marker = %+v, want TheIntroDB's confidence and submission count", m)
+	}
+}
+
+func TestProviderErrorMarksUnsubmittableAsInvalidArgument(t *testing.T) {
+	err := providerError(fmt.Errorf("%w: submit requires a TVDB, TMDB, or IMDb id", provider.ErrUnsubmittable))
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument so the host records a permanent refusal", status.Code(err))
+	}
+	if status.Code(providerError(fmt.Errorf("introdb: submit HTTP 500: unavailable"))) == codes.InvalidArgument {
+		t.Fatal("a server error must stay retryable")
+	}
+}

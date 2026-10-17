@@ -7,7 +7,7 @@ import (
 
 func TestResponseCacheBoundsAndExpiresEntries(t *testing.T) {
 	cache := newResponseCache(2)
-	cache.Set("a", &mediaResponse{TmdbID: 1}, time.Hour)
+	cache.Set("a", &mediaResponse{TvdbID: 1}, time.Hour)
 	cache.Set("b", nil, time.Hour)
 	if _, ok := cache.Get("a"); !ok {
 		t.Fatal("missing first entry")
@@ -19,7 +19,7 @@ func TestResponseCacheBoundsAndExpiresEntries(t *testing.T) {
 	if value, ok := cache.Get("c"); !ok || value != nil {
 		t.Fatal("negative lookup was not cached")
 	}
-	cache.Set("a", &mediaResponse{TmdbID: 2}, time.Hour)
+	cache.Set("a", &mediaResponse{TvdbID: 2}, time.Hour)
 	if len(cache.entries) != 2 {
 		t.Fatalf("cache has %d entries, want 2", len(cache.entries))
 	}

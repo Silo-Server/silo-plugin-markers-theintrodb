@@ -7,7 +7,7 @@
     "display_name": "TheIntroDB Markers",
     "summary": "Fetch and submit intro, credits, recap, and preview markers through TheIntroDB.",
     "description_markdown": "Adds community-maintained playback markers from TheIntroDB to movies and TV episodes. It can fetch markers without an account and can submit corrections or new markers when an API key is configured.",
-    "setup_markdown": "Install the plugin and enable **TheIntroDB** as a marker provider. Fetching works without configuration. Add your TheIntroDB API key if you want to submit markers or view account statistics.",
+    "setup_markdown": "Install the plugin and enable **TheIntroDB** as a marker provider. Fetching works without configuration. To submit markers or view account statistics, add an API key from your account at **theintrodb.org**. IntroDB (introdb.app) is a different service, and its keys are rejected with `401 Invalid or expired token`. A key also raises the daily lookup budget, which helps large libraries. Submissions are credited to the account that owns the key.",
     "homepage_url": "https://theintrodb.org",
     "source_url": "https://github.com/Silo-Server/silo-plugin-markers-theintrodb",
     "support_url": "https://github.com/Silo-Server/silo-plugin-markers-theintrodb/issues",
@@ -37,7 +37,6 @@
       "display_name": "TheIntroDB",
       "description": "Fetches and submits intro, credits, recap, and preview markers using TheIntroDB.",
       "metadata": {
-        "required_external_ids": ["tmdb"],
         "default_fetch_priority": 100
       }
     }
@@ -46,7 +45,7 @@
     {
       "key": "account",
       "title": "TheIntroDB Account",
-      "description": "Optional TheIntroDB API key used for submissions and account statistics.",
+      "description": "Optional theintrodb.org API key used for submissions, account statistics, and a larger lookup budget.",
       "json_schema": "{\"type\":\"object\",\"properties\":{\"api_key\":{\"type\":\"string\"}},\"additionalProperties\":false}",
       "required": false,
       "admin_form": {
@@ -55,7 +54,7 @@
           {
             "key": "api_key",
             "label": "API Key",
-            "description": "TheIntroDB API key from your profile.",
+            "description": "API key from your theintrodb.org account.",
             "control": "ADMIN_FORM_CONTROL_PASSWORD",
             "secret": true
           }
