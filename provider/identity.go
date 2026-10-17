@@ -43,7 +43,9 @@ type Target struct {
 // v4 keys media by TVDB and resolves TMDB and IMDb IDs server-side, so a movie,
 // which has no numbering, prefers its TVDB ID. An episode is addressed by the
 // series ID of the provider whose numbering it follows: Silo reports it in
-// episode.Numbering. A host that predates that field leaves it empty, and then
+// episode.Numbering. Without that provider's series ID the episode has no
+// target, since another ID would name a different episode wherever the
+// numberings differ. A host that predates that field leaves it empty, and then
 // only an episode TVDB supplied without TMDB is known to use TVDB's numbers.
 // Any other episode may follow TMDB's numbering, so tmdb_id lets TheIntroDB
 // convert it, with TVDB and then IMDb as fallbacks.
@@ -61,9 +63,14 @@ func NewTarget(kind ItemKind, ids map[string]string, episode Episode) (Target, b
 		episodeTVDB = validNumericID(episode.ExternalIDs[ExternalIDKeyTVDB], 0)
 		switch strings.ToLower(strings.TrimSpace(episode.Numbering)) {
 		case ExternalIDKeyTVDB:
+			if tvdb == "" {
+				return Target{}, false
+			}
 			tvdbNumbered = true
 		case ExternalIDKeyTMDB:
-			// TMDB's numbering: the series is addressed by TMDB.
+			if tmdb == "" {
+				return Target{}, false
+			}
 		default:
 			// An older host, or a numbering this plugin does not know.
 			tvdbNumbered = episodeTVDB != "" && strings.TrimSpace(episode.ExternalIDs[ExternalIDKeyTMDB]) == ""

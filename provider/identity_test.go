@@ -49,12 +49,18 @@ func TestNewTargetChoosesTheIDTheNumbersBelongTo(t *testing.T) {
 			ok:      true,
 		},
 		{
-			name:    "TMDB numbering falls back to TVDB without a series TMDB ID",
+			// TVDB would read TMDB's numbers as its own, naming another
+			// episode wherever the numberings differ.
+			name:    "TMDB numbering without a series TMDB ID has no target",
 			kind:    ItemKindEpisode,
-			ids:     map[string]string{ExternalIDKeyTVDB: "121361"},
+			ids:     map[string]string{ExternalIDKeyTVDB: "121361", ExternalIDKeyIMDB: "tt0944947"},
 			episode: Episode{ExternalIDs: bothIDs, Numbering: "tmdb"},
-			want:    Target{Param: "tvdb_id", ID: "121361"},
-			ok:      true,
+		},
+		{
+			name:    "TVDB numbering without a series TVDB ID has no target",
+			kind:    ItemKindEpisode,
+			ids:     map[string]string{ExternalIDKeyTMDB: "1399", ExternalIDKeyIMDB: "tt0944947"},
+			episode: Episode{ExternalIDs: bothIDs, Numbering: "tvdb"},
 		},
 		{
 			// A host that predates episode_numbering: only an episode TVDB
@@ -90,10 +96,10 @@ func TestNewTargetChoosesTheIDTheNumbersBelongTo(t *testing.T) {
 			ok:   true,
 		},
 		{
-			name:    "IMDb is the last resort and carries the title",
+			name:    "IMDb is the last resort when the numbering is unknown, and carries the title",
 			kind:    ItemKindEpisode,
 			ids:     map[string]string{ExternalIDKeyIMDB: "tt0944947"},
-			episode: Episode{Numbering: "tvdb", Title: "Pilot"},
+			episode: Episode{Title: "Pilot"},
 			want:    Target{Param: "imdb_id", ID: "tt0944947", EpisodeName: "Pilot"},
 			ok:      true,
 		},

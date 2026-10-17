@@ -320,6 +320,12 @@ func TestSubmitFailuresTheHostCanActOn(t *testing.T) {
 			wantText:  "Cloudflare blocked request (HTTP 403, cf-ray ray-1)",
 		},
 		{
+			// TheIntroDB's own JSON errors also pass through Cloudflare.
+			name:     "origin 403 through Cloudflare",
+			answer:   answer{403, "application/json; charset=utf-8", map[string]string{"CF-Ray": "ray-2", "Server": "cloudflare"}, `{"error":"Your account has been locked"}`},
+			wantText: "introdb: submit HTTP 403: Your account has been locked",
+		},
+		{
 			// The host records "submit HTTP 404" as a permanent refusal,
 			// so a missing route must not carry that text.
 			name:     "missing route",
@@ -333,7 +339,9 @@ func TestSubmitFailuresTheHostCanActOn(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			var requests int
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
 				for k, v := range tt.answer.headers {
 					w.Header().Set(k, v)
 				}
@@ -359,6 +367,9 @@ func TestSubmitFailuresTheHostCanActOn(t *testing.T) {
 			}
 			if tt.wantRetry == 0 && errors.As(err, &retryErr) {
 				t.Fatalf("error = %v, want no cooldown", err)
+			}
+			if strings.Contains(err.Error(), "<html>") || requests != 1 {
+				t.Fatalf("error = %q after %d requests, want one request and no page body", err, requests)
 			}
 		})
 	}
@@ -407,12 +418,17 @@ func TestSubmitSkipsAKeyTheIntroDBRejected(t *testing.T) {
 	if submits != 2 {
 		t.Fatalf("submit requests after a good key check = %d, want 2", submits)
 	}
-	// So does a new key.
+	// So does a new key, and returning to a rejected key tries it again.
 	_ = submit()
 	c.SetAPIKey("theintrodb-key")
 	_ = submit()
 	if submits != 3 {
 		t.Fatalf("submit requests after a key change = %d, want 3", submits)
+	}
+	c.SetAPIKey("wrong-site-key")
+	_ = submit()
+	if submits != 4 {
+		t.Fatalf("submit requests after restoring a rejected key = %d, want 4", submits)
 	}
 }
 

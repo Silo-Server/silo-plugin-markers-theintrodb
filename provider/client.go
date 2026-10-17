@@ -110,6 +110,7 @@ func (c *Client) SetAPIKey(apiKey string) {
 		return
 	}
 	c.apiKey = apiKey
+	c.rejectedKey, c.rejectedUntil = "", time.Time{}
 	c.cache = newResponseCache(maxCacheEntries)
 	c.lookupLimiter.SetLimit(anonymousLookupRate)
 	c.lookupLimiter.SetBurst(anonymousLookupBurst)
@@ -133,7 +134,7 @@ func (c *Client) followRateLimit(headers http.Header) {
 }
 
 // rejectKey remembers that TheIntroDB refused apiKey, unless it has since
-// been replaced.
+// been replaced. Any key change clears it.
 func (c *Client) rejectKey(apiKey string) {
 	c.mu.Lock()
 	if c.apiKey == apiKey {
