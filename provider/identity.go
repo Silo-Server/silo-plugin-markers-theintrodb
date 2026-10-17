@@ -17,7 +17,8 @@ const (
 )
 
 // validCoordinates reports whether TheIntroDB accepts an episode's numbers.
-// Season 0 holds specials.
+// Season 0 holds specials. TheIntroDB also accepts episode 0, but Silo sends
+// 0 for an episode it could not number, so episode 0 is refused here.
 func validCoordinates(season, episode int) bool {
 	return season >= 0 && season <= maxSeason && episode > 0 && episode <= maxEpisode
 }
@@ -27,7 +28,8 @@ var imdbIDPattern = regexp.MustCompile(`^tt[0-9]{7,8}$`)
 // Target is the one media ID a request addresses TheIntroDB by, plus the
 // optional hints that refine a TV episode. TheIntroDB reads season and episode
 // numbers in the space of the ID it is given: TVDB's default order for
-// tvdb_id, TMDB's numbering for tmdb_id.
+// tvdb_id, TMDB's numbering for tmdb_id. TVDBEpisodeID is documented to pin
+// the record on submissions; lookups ignore it and EpisodeName today.
 type Target struct {
 	Param         string // "tvdb_id", "tmdb_id" or "imdb_id"
 	ID            string
@@ -39,14 +41,13 @@ type Target struct {
 // ID.
 //
 // v4 keys media by TVDB and resolves TMDB and IMDb IDs server-side, so a movie,
-// which has no numbering, prefers its TVDB ID. An episode's numbers belong to
-// whichever metadata providers supplied Silo's episode row, which matches
-// providers' episodes by number alone. Only a row TVDB supplied without TMDB
-// is known to use TVDB's numbers; the series' TVDB ID then addresses it in
-// the same space, and its TVDB episode ID pins the record. Any other row may
-// follow TMDB's numbering, so tmdb_id lets TheIntroDB convert it, with TVDB
-// and then IMDb as fallbacks.
-func NewTarget(kind ItemKind, ids, episodeIDs map[string]string, episodeTitle string) (Target, bool) {
+// which has no numbering, prefers its TVDB ID. An episode is addressed by the
+// series ID of the provider whose numbering it follows: Silo reports it in
+// episode.Numbering. A host that predates that field leaves it empty, and then
+// only an episode TVDB supplied without TMDB is known to use TVDB's numbers.
+// Any other episode may follow TMDB's numbering, so tmdb_id lets TheIntroDB
+// convert it, with TVDB and then IMDb as fallbacks.
+func NewTarget(kind ItemKind, ids map[string]string, episode Episode) (Target, bool) {
 	tvdb := validNumericID(ids[ExternalIDKeyTVDB], maxTVDBID)
 	tmdb := validNumericID(ids[ExternalIDKeyTMDB], maxTMDBID)
 	imdb := strings.TrimSpace(ids[ExternalIDKeyIMDB])
@@ -54,12 +55,23 @@ func NewTarget(kind ItemKind, ids, episodeIDs map[string]string, episodeTitle st
 		imdb = ""
 	}
 
-	var t Target
-	tvdbEpisode := ""
-	if kind == ItemKindEpisode && strings.TrimSpace(episodeIDs[ExternalIDKeyTMDB]) == "" {
-		tvdbEpisode = validNumericID(episodeIDs[ExternalIDKeyTVDB], 0)
+	tvdbNumbered := false
+	episodeTVDB := ""
+	if kind == ItemKindEpisode {
+		episodeTVDB = validNumericID(episode.ExternalIDs[ExternalIDKeyTVDB], 0)
+		switch strings.ToLower(strings.TrimSpace(episode.Numbering)) {
+		case ExternalIDKeyTVDB:
+			tvdbNumbered = true
+		case ExternalIDKeyTMDB:
+			// TMDB's numbering: the series is addressed by TMDB.
+		default:
+			// An older host, or a numbering this plugin does not know.
+			tvdbNumbered = episodeTVDB != "" && strings.TrimSpace(episode.ExternalIDs[ExternalIDKeyTMDB]) == ""
+		}
 	}
-	preferTVDB := kind == ItemKindMovie || tvdbEpisode != ""
+
+	var t Target
+	preferTVDB := kind == ItemKindMovie || tvdbNumbered
 	switch {
 	case tvdb != "" && (preferTVDB || tmdb == ""):
 		t = Target{Param: "tvdb_id", ID: tvdb}
@@ -72,12 +84,14 @@ func NewTarget(kind ItemKind, ids, episodeIDs map[string]string, episodeTitle st
 	}
 	if kind == ItemKindEpisode {
 		// The pin names a record in TVDB's numbering, so it goes only with a
-		// tvdb_id request. TheIntroDB ignores the title hint for tmdb_id.
-		if t.Param == "tvdb_id" {
-			t.TVDBEpisodeID = tvdbEpisode
+		// tvdb_id request for a TVDB-numbered episode. The title only
+		// corroborates an episode the request cannot pin, and TheIntroDB
+		// ignores it for tmdb_id.
+		if t.Param == "tvdb_id" && tvdbNumbered {
+			t.TVDBEpisodeID = episodeTVDB
 		}
-		if t.Param != "tmdb_id" {
-			t.EpisodeName = strings.TrimSpace(episodeTitle)
+		if t.TVDBEpisodeID == "" && t.Param != "tmdb_id" {
+			t.EpisodeName = strings.TrimSpace(episode.Title)
 		}
 	}
 	return t, true

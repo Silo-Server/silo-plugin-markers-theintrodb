@@ -127,7 +127,7 @@ func TestProviderValidatesSegmentBounds(t *testing.T) {
 }
 
 func TestProviderUsesTheIntroDBConfidence(t *testing.T) {
-	p := newProvider(t, `{"tvdb_id":121361,"type":"tv","season":1,"episode":1,"group_duration_ms":3695000,
+	p := newProvider(t, `{"tvdb_id":121361,"type":"tv","season":1,"episode":1,"group_duration_ms":1795000,
 		"intro":[{"start_ms":436000,"end_ms":535000,"confidence":0.67,"submission_count":5}],
 		"credits":[{"start_ms":1700000,"end_ms":null,"confidence":1.7,"submission_count":-2}]}`)
 	res, err := p.FetchMarkers(context.Background(), episodeReq(map[string]string{ExternalIDKeyTVDB: "121361"}))
@@ -181,5 +181,42 @@ func TestProviderSkipsCoordinatesTheIntroDBRefuses(t *testing.T) {
 	}
 	if hits != 0 {
 		t.Fatalf("requests = %d, want none for numbers TheIntroDB refuses", hits)
+	}
+}
+
+func TestProviderDropsEndSegmentsFromAnotherRelease(t *testing.T) {
+	body := `{"tvdb_id":169,"type":"movie","group_duration_ms":%d,
+		"intro":[{"start_ms":null,"end_ms":40000}],
+		"recap":[{"start_ms":null,"end_ms":20000}],
+		"credits":[{"start_ms":7800000,"end_ms":null}],
+		"preview":[{"start_ms":7900000,"end_ms":7950000}]}`
+	movie := Request{Kind: ItemKindMovie, ExternalIDs: map[string]string{ExternalIDKeyTMDB: "603"}, Duration: 9000 * time.Second}
+	kinds := func(markers []Marker) []MarkerKind {
+		var out []MarkerKind
+		for _, m := range markers {
+			out = append(out, m.Kind)
+		}
+		return out
+	}
+	for _, tt := range []struct {
+		name  string
+		group int64
+		want  []MarkerKind
+	}{
+		// TheIntroDB fell back to a release 20 minutes shorter: the intro
+		// and recap still fit, the credits and preview would start early.
+		{name: "another release", group: 7_800_000, want: []MarkerKind{MarkerKindIntro, MarkerKindRecap}},
+		{name: "same release", group: 8_800_000, want: []MarkerKind{MarkerKindIntro, MarkerKindCredits, MarkerKindRecap, MarkerKindPreview}},
+		{name: "unknown release length", group: 0, want: []MarkerKind{MarkerKindIntro, MarkerKindCredits, MarkerKindRecap, MarkerKindPreview}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := newProvider(t, fmt.Sprintf(body, tt.group)).FetchMarkers(context.Background(), movie)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := kinds(res.Markers); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("markers = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

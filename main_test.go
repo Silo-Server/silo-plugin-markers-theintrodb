@@ -164,14 +164,15 @@ func TestMarkerServerPassesEpisodeIdentityAndDetails(t *testing.T) {
 		SeasonNumber:       1,
 		EpisodeNumber:      1,
 		DurationSeconds:    3695,
-		EpisodeExternalIds: &pluginv1.MarkerExternalIDs{TvdbId: "3254641"},
+		EpisodeExternalIds: &pluginv1.MarkerExternalIDs{TvdbId: "3254641", TmdbId: "63056"},
+		EpisodeNumbering:   "tvdb",
 		EpisodeTitle:       "Winter Is Coming",
 	})
 	if err != nil {
 		t.Fatalf("FetchMarkers: %v", err)
 	}
 	if gotQuery.Get("tvdb_id") != "121361" || gotQuery.Get("tmdb_id") != "" ||
-		gotQuery.Get("tvdb_episode_id") != "3254641" || gotQuery.Get("episode_name") != "Winter Is Coming" {
+		gotQuery.Get("tvdb_episode_id") != "3254641" || gotQuery.Has("episode_name") {
 		t.Fatalf("query = %s, want the TVDB-numbered episode addressed by TVDB", gotQuery.Encode())
 	}
 	if len(resp.GetMarkers()) != 1 {

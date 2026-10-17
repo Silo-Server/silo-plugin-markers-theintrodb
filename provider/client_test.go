@@ -125,7 +125,9 @@ func TestFetchEpisodeMissCostsOneRequest(t *testing.T) {
 	var queries []url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		queries = append(queries, r.URL.Query())
-		http.NotFound(w, r)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"media not found"}`))
 	}))
 	defer srv.Close()
 
@@ -211,7 +213,7 @@ func TestFetchEpisodeReportsOriginForbiddenAsHTTPError(t *testing.T) {
 	c.SetBaseURL(srv.URL)
 	_, err := c.FetchEpisode(context.Background(), idTarget(ItemKindEpisode, "111", "", ""), 1, 2, 0)
 	var blocked *RetryAfterError
-	if err == nil || errors.As(err, &blocked) || !strings.Contains(err.Error(), `HTTP 403: {"error":"forbidden"}`) {
+	if err == nil || errors.As(err, &blocked) || !strings.Contains(err.Error(), `HTTP 403: forbidden`) {
 		t.Fatalf("error = %v, want origin HTTP 403 without a provider cooldown", err)
 	}
 }
@@ -300,7 +302,7 @@ func TestIsJSONResponseParsesTheMediaType(t *testing.T) {
 func idTarget(kind ItemKind, tmdbID, tvdbID, imdbID string) Target {
 	target, _ := NewTarget(kind, map[string]string{
 		ExternalIDKeyTMDB: tmdbID, ExternalIDKeyTVDB: tvdbID, ExternalIDKeyIMDB: imdbID,
-	}, nil, "")
+	}, Episode{})
 	return target
 }
 
@@ -317,7 +319,7 @@ func TestFetchEpisodeSendsV4Parameters(t *testing.T) {
 	c.SetBaseURL(srv.URL)
 	target, _ := NewTarget(ItemKindEpisode,
 		map[string]string{ExternalIDKeyTMDB: "1399", ExternalIDKeyTVDB: "121361"},
-		map[string]string{ExternalIDKeyTVDB: "4271129"}, "A Special")
+		Episode{ExternalIDs: map[string]string{ExternalIDKeyTVDB: "4271129"}, Numbering: "tvdb", Title: "A Special"})
 	response, err := c.FetchEpisode(context.Background(), target, 0, 4, 3_600_000)
 	if err != nil {
 		t.Fatalf("FetchEpisode: %v", err)
@@ -326,7 +328,7 @@ func TestFetchEpisodeSendsV4Parameters(t *testing.T) {
 		t.Fatalf("response tvdb_id = %d", response.TvdbID)
 	}
 	want := url.Values{
-		"tvdb_id": {"121361"}, "tvdb_episode_id": {"4271129"}, "episode_name": {"A Special"},
+		"tvdb_id": {"121361"}, "tvdb_episode_id": {"4271129"},
 		"season": {"0"}, "episode": {"4"}, "duration_ms": {"3600000"}, "details": {"true"},
 	}
 	if gotPath != "/media" || gotQuery.Encode() != want.Encode() {
@@ -357,20 +359,55 @@ func TestFetchSpecificMediaLimitDoesNotPauseProvider(t *testing.T) {
 	}
 }
 
-func TestAPIKeyRaisesLookupBudget(t *testing.T) {
-	c := NewClient("")
+func TestLookupLimiterFollowsReportedCeiling(t *testing.T) {
+	ceiling := "120"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-RateLimit-Limit", ceiling)
+		_, _ = w.Write([]byte(`{"tvdb_id":169,"type":"movie"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("secret-key")
+	c.SetBaseURL(srv.URL)
+	// A key alone does not raise the rate: TheIntroDB treats a key it does
+	// not accept as anonymous.
 	if c.lookupLimiter.Limit() != anonymousLookupRate || c.lookupLimiter.Burst() != anonymousLookupBurst {
-		t.Fatalf("anonymous limiter = %v/%d", c.lookupLimiter.Limit(), c.lookupLimiter.Burst())
+		t.Fatalf("limiter before any response = %v/%d", c.lookupLimiter.Limit(), c.lookupLimiter.Burst())
 	}
-	c.SetAPIKey("secret-key")
-	if c.lookupLimiter.Limit() != keyedLookupRate || c.lookupLimiter.Burst() != keyedLookupBurst {
-		t.Fatalf("keyed limiter = %v/%d", c.lookupLimiter.Limit(), c.lookupLimiter.Burst())
+	if _, err := c.FetchMovie(context.Background(), idTarget(ItemKindMovie, "603", "", ""), 0); err != nil {
+		t.Fatal(err)
+	}
+	// 120 per 10 s, a fifth held back: 9.6/s with a burst of 20, at most 116
+	// requests in any window.
+	if c.lookupLimiter.Limit() != 9.6 || c.lookupLimiter.Burst() != 20 {
+		t.Fatalf("limiter after a 120 ceiling = %v/%d", c.lookupLimiter.Limit(), c.lookupLimiter.Burst())
+	}
+	ceiling = "30"
+	if _, err := c.FetchMovie(context.Background(), idTarget(ItemKindMovie, "27205", "", ""), 0); err != nil {
+		t.Fatal(err)
+	}
+	if c.lookupLimiter.Limit() != 2.4 || c.lookupLimiter.Burst() != 5 {
+		t.Fatalf("limiter after a 30 ceiling = %v/%d", c.lookupLimiter.Limit(), c.lookupLimiter.Burst())
 	}
 	if c.writeLimiter.Limit() != writeRate {
 		t.Fatalf("write limiter = %v, want unchanged %v", c.writeLimiter.Limit(), writeRate)
 	}
-	c.SetAPIKey("")
+	c.SetAPIKey("other-key")
 	if c.lookupLimiter.Limit() != anonymousLookupRate {
-		t.Fatalf("limiter after removing the key = %v", c.lookupLimiter.Limit())
+		t.Fatalf("limiter after a key change = %v, want the anonymous start", c.lookupLimiter.Limit())
+	}
+}
+
+func TestFetchTreatsAMissingEndpointAsAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Cannot GET /v4/media", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := NewClient("")
+	c.SetBaseURL(srv.URL)
+	response, err := c.FetchMovie(context.Background(), idTarget(ItemKindMovie, "603", "", ""), 0)
+	if err == nil || response != nil || !strings.Contains(err.Error(), "endpoint not found") {
+		t.Fatalf("response = %v, err = %v; want an error, not a cached miss", response, err)
 	}
 }

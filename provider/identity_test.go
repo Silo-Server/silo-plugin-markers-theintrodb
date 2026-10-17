@@ -6,67 +6,96 @@ import (
 )
 
 func TestNewTargetChoosesTheIDTheNumbersBelongTo(t *testing.T) {
+	got := map[string]string{ExternalIDKeyTMDB: "1399", ExternalIDKeyTVDB: "121361", ExternalIDKeyIMDB: "tt0944947"}
+	bothIDs := map[string]string{ExternalIDKeyTVDB: "3254641", ExternalIDKeyTMDB: "63056"}
 	for _, tt := range []struct {
-		name       string
-		kind       ItemKind
-		ids        map[string]string
-		episodeIDs map[string]string
-		title      string
-		want       Target
-		ok         bool
+		name    string
+		kind    ItemKind
+		ids     map[string]string
+		episode Episode
+		want    Target
+		ok      bool
 	}{
 		{
-			name:       "episode only TVDB supplied uses the series TVDB ID and pins the episode",
-			kind:       ItemKindEpisode,
-			ids:        map[string]string{ExternalIDKeyTMDB: "1399", ExternalIDKeyTVDB: "121361", ExternalIDKeyIMDB: "tt0944947"},
-			episodeIDs: map[string]string{ExternalIDKeyTVDB: "3254641"},
-			title:      " Winter Is Coming ",
-			want:       Target{Param: "tvdb_id", ID: "121361", TVDBEpisodeID: "3254641", EpisodeName: "Winter Is Coming"},
-			ok:         true,
+			name:    "TVDB numbering uses the series TVDB ID and pins the episode",
+			kind:    ItemKindEpisode,
+			ids:     got,
+			episode: Episode{ExternalIDs: bothIDs, Numbering: "tvdb", Title: "Winter Is Coming"},
+			want:    Target{Param: "tvdb_id", ID: "121361", TVDBEpisodeID: "3254641"},
+			ok:      true,
 		},
 		{
-			// Silo matches providers' episodes by number, so a row carrying
-			// both IDs may follow either numbering; TMDB keeps the behavior
-			// that predates v4 and no pin can name the wrong record.
-			name:       "episode both providers supplied stays on TMDB without a pin",
-			kind:       ItemKindEpisode,
-			ids:        map[string]string{ExternalIDKeyTMDB: "1399", ExternalIDKeyTVDB: "121361"},
-			episodeIDs: map[string]string{ExternalIDKeyTVDB: "3254641", ExternalIDKeyTMDB: "63056"},
-			title:      "Winter Is Coming",
-			want:       Target{Param: "tmdb_id", ID: "1399"},
-			ok:         true,
+			name:    "TMDB numbering lets TheIntroDB convert TMDB numbers",
+			kind:    ItemKindEpisode,
+			ids:     got,
+			episode: Episode{ExternalIDs: bothIDs, Numbering: "tmdb", Title: "Winter Is Coming"},
+			want:    Target{Param: "tmdb_id", ID: "1399"},
+			ok:      true,
 		},
 		{
-			name:       "TMDB-numbered episode lets TheIntroDB convert TMDB numbers",
-			kind:       ItemKindEpisode,
-			ids:        map[string]string{ExternalIDKeyTMDB: "1399", ExternalIDKeyTVDB: "121361"},
-			episodeIDs: map[string]string{ExternalIDKeyTMDB: "63056"},
-			title:      "Winter Is Coming",
-			want:       Target{Param: "tmdb_id", ID: "1399"},
-			ok:         true,
+			name:    "numbering is case-insensitive",
+			kind:    ItemKindEpisode,
+			ids:     got,
+			episode: Episode{ExternalIDs: bothIDs, Numbering: " TVDB "},
+			want:    Target{Param: "tvdb_id", ID: "121361", TVDBEpisodeID: "3254641"},
+			ok:      true,
 		},
 		{
-			name:       "a pin never accompanies a TMDB request",
-			kind:       ItemKindEpisode,
-			ids:        map[string]string{ExternalIDKeyTMDB: "1399"},
-			episodeIDs: map[string]string{ExternalIDKeyTVDB: "3254641"},
-			want:       Target{Param: "tmdb_id", ID: "1399"},
-			ok:         true,
+			name:    "TVDB numbering without the episode's TVDB ID sends the title instead of a pin",
+			kind:    ItemKindEpisode,
+			ids:     got,
+			episode: Episode{Numbering: "tvdb", Title: " Pilot "},
+			want:    Target{Param: "tvdb_id", ID: "121361", EpisodeName: "Pilot"},
+			ok:      true,
 		},
 		{
-			name:  "series known only to TVDB",
-			kind:  ItemKindEpisode,
-			ids:   map[string]string{ExternalIDKeyTVDB: "121361", ExternalIDKeyIMDB: "tt0944947"},
-			title: "Pilot",
-			want:  Target{Param: "tvdb_id", ID: "121361", EpisodeName: "Pilot"},
-			ok:    true,
+			name:    "TMDB numbering falls back to TVDB without a series TMDB ID",
+			kind:    ItemKindEpisode,
+			ids:     map[string]string{ExternalIDKeyTVDB: "121361"},
+			episode: Episode{ExternalIDs: bothIDs, Numbering: "tmdb"},
+			want:    Target{Param: "tvdb_id", ID: "121361"},
+			ok:      true,
 		},
 		{
-			name: "IMDb is the last resort",
+			// A host that predates episode_numbering: only an episode TVDB
+			// supplied without TMDB is known to follow TVDB's numbers.
+			name:    "older host, episode only TVDB supplied",
+			kind:    ItemKindEpisode,
+			ids:     got,
+			episode: Episode{ExternalIDs: map[string]string{ExternalIDKeyTVDB: "3254641"}},
+			want:    Target{Param: "tvdb_id", ID: "121361", TVDBEpisodeID: "3254641"},
+			ok:      true,
+		},
+		{
+			name:    "older host, episode both providers supplied",
+			kind:    ItemKindEpisode,
+			ids:     got,
+			episode: Episode{ExternalIDs: bothIDs},
+			want:    Target{Param: "tmdb_id", ID: "1399"},
+			ok:      true,
+		},
+		{
+			name:    "unknown numbering reads as empty",
+			kind:    ItemKindEpisode,
+			ids:     got,
+			episode: Episode{ExternalIDs: bothIDs, Numbering: "anidb"},
+			want:    Target{Param: "tmdb_id", ID: "1399"},
+			ok:      true,
+		},
+		{
+			name: "series known only to TVDB",
 			kind: ItemKindEpisode,
-			ids:  map[string]string{ExternalIDKeyIMDB: "tt0944947"},
-			want: Target{Param: "imdb_id", ID: "tt0944947"},
+			ids:  map[string]string{ExternalIDKeyTVDB: "121361", ExternalIDKeyIMDB: "tt0944947"},
+			want: Target{Param: "tvdb_id", ID: "121361"},
 			ok:   true,
+		},
+		{
+			name:    "IMDb is the last resort and carries the title",
+			kind:    ItemKindEpisode,
+			ids:     map[string]string{ExternalIDKeyIMDB: "tt0944947"},
+			episode: Episode{Numbering: "tvdb", Title: "Pilot"},
+			want:    Target{Param: "imdb_id", ID: "tt0944947", EpisodeName: "Pilot"},
+			ok:      true,
 		},
 		{
 			name: "movie prefers TVDB",
@@ -76,13 +105,12 @@ func TestNewTargetChoosesTheIDTheNumbersBelongTo(t *testing.T) {
 			ok:   true,
 		},
 		{
-			name:       "movie ignores episode hints",
-			kind:       ItemKindMovie,
-			ids:        map[string]string{ExternalIDKeyTMDB: "603"},
-			episodeIDs: map[string]string{ExternalIDKeyTVDB: "1"},
-			title:      "not an episode",
-			want:       Target{Param: "tmdb_id", ID: "603"},
-			ok:         true,
+			name:    "movie ignores episode hints",
+			kind:    ItemKindMovie,
+			ids:     map[string]string{ExternalIDKeyTMDB: "603"},
+			episode: Episode{ExternalIDs: map[string]string{ExternalIDKeyTVDB: "1"}, Numbering: "tvdb", Title: "not an episode"},
+			want:    Target{Param: "tmdb_id", ID: "603"},
+			ok:      true,
 		},
 		{
 			name: "malformed IDs are skipped instead of drawing a 422",
@@ -92,12 +120,12 @@ func TestNewTargetChoosesTheIDTheNumbersBelongTo(t *testing.T) {
 			ok:   true,
 		},
 		{
-			name:       "a malformed episode TVDB ID does not move the episode to TVDB",
-			kind:       ItemKindEpisode,
-			ids:        map[string]string{ExternalIDKeyTMDB: "1399", ExternalIDKeyTVDB: "121361"},
-			episodeIDs: map[string]string{ExternalIDKeyTVDB: "-4"},
-			want:       Target{Param: "tmdb_id", ID: "1399"},
-			ok:         true,
+			name:    "a malformed episode TVDB ID is no pin",
+			kind:    ItemKindEpisode,
+			ids:     got,
+			episode: Episode{ExternalIDs: map[string]string{ExternalIDKeyTVDB: "-4"}, Numbering: "tvdb"},
+			want:    Target{Param: "tvdb_id", ID: "121361"},
+			ok:      true,
 		},
 		{
 			name: "IDs are canonicalized",
@@ -113,9 +141,9 @@ func TestNewTargetChoosesTheIDTheNumbersBelongTo(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := NewTarget(tt.kind, tt.ids, tt.episodeIDs, tt.title)
-			if ok != tt.ok || got != tt.want {
-				t.Fatalf("NewTarget = %+v, %v; want %+v, %v", got, ok, tt.want, tt.ok)
+			target, ok := NewTarget(tt.kind, tt.ids, tt.episode)
+			if ok != tt.ok || target != tt.want {
+				t.Fatalf("NewTarget = %+v, %v; want %+v, %v", target, ok, tt.want, tt.ok)
 			}
 		})
 	}

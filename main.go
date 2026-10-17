@@ -153,26 +153,24 @@ func apiKeyFromConfig(entries []*pluginv1.ConfigEntry) string {
 
 func requestFromProto(req *pluginv1.FetchMarkersRequest) provider.Request {
 	return provider.Request{
-		Kind:               itemKind(req.GetItemType()),
-		ExternalIDs:        externalIDs(req.GetExternalIds()),
-		SeasonNumber:       int(req.GetSeasonNumber()),
-		EpisodeNumber:      int(req.GetEpisodeNumber()),
-		EpisodeExternalIDs: externalIDs(req.GetEpisodeExternalIds()),
-		EpisodeTitle:       strings.TrimSpace(req.GetEpisodeTitle()),
-		Duration:           secondsDuration(req.GetDurationSeconds()),
+		Kind:          itemKind(req.GetItemType()),
+		ExternalIDs:   externalIDs(req.GetExternalIds()),
+		SeasonNumber:  int(req.GetSeasonNumber()),
+		EpisodeNumber: int(req.GetEpisodeNumber()),
+		Episode:       episodeFromProto(req.GetEpisodeExternalIds(), req.GetEpisodeNumbering(), req.GetEpisodeTitle()),
+		Duration:      secondsDuration(req.GetDurationSeconds()),
 	}
 }
 
 func submissionFromProto(req *pluginv1.SubmitMarkerRequest) provider.SubmissionRequest {
 	out := provider.SubmissionRequest{
-		Kind:               itemKind(req.GetItemType()),
-		ExternalIDs:        externalIDs(req.GetExternalIds()),
-		SeasonNumber:       int(req.GetSeasonNumber()),
-		EpisodeNumber:      int(req.GetEpisodeNumber()),
-		EpisodeExternalIDs: externalIDs(req.GetEpisodeExternalIds()),
-		EpisodeTitle:       strings.TrimSpace(req.GetEpisodeTitle()),
-		Segment:            markerKind(req.GetSegment()),
-		Duration:           secondsDuration(req.GetDurationSeconds()),
+		Kind:          itemKind(req.GetItemType()),
+		ExternalIDs:   externalIDs(req.GetExternalIds()),
+		SeasonNumber:  int(req.GetSeasonNumber()),
+		EpisodeNumber: int(req.GetEpisodeNumber()),
+		Episode:       episodeFromProto(req.GetEpisodeExternalIds(), req.GetEpisodeNumbering(), req.GetEpisodeTitle()),
+		Segment:       markerKind(req.GetSegment()),
+		Duration:      secondsDuration(req.GetDurationSeconds()),
 	}
 	if req.StartSeconds != nil {
 		start := secondsDuration(req.GetStartSeconds())
@@ -183,6 +181,14 @@ func submissionFromProto(req *pluginv1.SubmitMarkerRequest) provider.SubmissionR
 		out.End = &end
 	}
 	return out
+}
+
+func episodeFromProto(ids *pluginv1.MarkerExternalIDs, numbering, title string) provider.Episode {
+	return provider.Episode{
+		ExternalIDs: externalIDs(ids),
+		Numbering:   strings.TrimSpace(numbering),
+		Title:       strings.TrimSpace(title),
+	}
 }
 
 func externalIDs(ids *pluginv1.MarkerExternalIDs) map[string]string {

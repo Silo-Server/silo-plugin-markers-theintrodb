@@ -19,7 +19,8 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
 func jsonResponse(status int, body string) *http.Response {
-	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
+	header := http.Header{"Content-Type": {"application/json"}}
+	return &http.Response{StatusCode: status, Header: header, Body: io.NopCloser(strings.NewReader(body))}
 }
 
 func TestFetchSharesConcurrentWorkAcrossCancellation(t *testing.T) {
@@ -185,6 +186,9 @@ func TestRetryDelayUsesApplicableReset(t *testing.T) {
 		{"rate reset with remaining daily quota", map[string]string{"X-UsageLimit-Reset": "86400", "X-UsageLimit-Remaining": "400", "X-RateLimit-Reset": "7"}, 7 * time.Second},
 		{"all exhausted limits", map[string]string{"Retry-After": "1", "X-UsageLimit-Reset": "86400", "X-UsageLimit-Remaining": "0", "X-RateLimit-Reset": "7"}, 24 * time.Hour},
 		{"invalid hints", map[string]string{"Retry-After": "garbage", "X-UsageLimit-Reset": "9223372036854775807", "X-RateLimit-Reset": "-2"}, 10 * time.Second},
+		{"spent daily budget reporting a zero reset", map[string]string{"X-UsageLimit-Remaining": "0", "X-UsageLimit-Reset": "0"}, time.Hour},
+		{"spent burst window reporting a zero reset", map[string]string{"X-UsageLimit-Remaining": "4000", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "0"}, 10 * time.Second},
+		{"retry after is capped", map[string]string{"Retry-After": "9999999"}, 25 * time.Hour},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			headers := make(http.Header)

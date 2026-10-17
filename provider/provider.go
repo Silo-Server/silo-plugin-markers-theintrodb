@@ -27,7 +27,7 @@ func (p *Provider) FetchMarkers(ctx context.Context, req Request) (Result, error
 		return Result{}, nil
 	}
 
-	target, ok := NewTarget(req.Kind, req.ExternalIDs, req.EpisodeExternalIDs, req.EpisodeTitle)
+	target, ok := NewTarget(req.Kind, req.ExternalIDs, req.Episode)
 	if !ok {
 		return Result{}, nil
 	}
@@ -54,16 +54,38 @@ func (p *Provider) FetchMarkers(ctx context.Context, req Request) (Result, error
 		return Result{}, nil
 	}
 
+	endsApply := sameRelease(resp, req.Duration)
 	result := Result{}
 	result.Markers = append(result.Markers, convertMarkers(resp.Intro, MarkerKindIntro, req.Duration)...)
-	result.Markers = append(result.Markers, convertMarkers(resp.Credits, MarkerKindCredits, req.Duration)...)
+	if endsApply {
+		result.Markers = append(result.Markers, convertMarkers(resp.Credits, MarkerKindCredits, req.Duration)...)
+	}
 	result.Markers = append(result.Markers, convertMarkers(resp.Recap, MarkerKindRecap, req.Duration)...)
-	result.Markers = append(result.Markers, convertMarkers(resp.Preview, MarkerKindPreview, req.Duration)...)
+	if endsApply {
+		result.Markers = append(result.Markers, convertMarkers(resp.Preview, MarkerKindPreview, req.Duration)...)
+	}
 	return result, nil
 }
 
-// The API has already selected a release using duration_ms. Each array entry is
-// a separate occurrence; in particular, credits may surround a scene to keep.
+// releaseTolerance is how far apart TheIntroDB treats two durations as one
+// release.
+const releaseTolerance = 5 * time.Minute
+
+// sameRelease reports whether the response's timestamps come from a release
+// whose length matches the file. With no release within the tolerance,
+// TheIntroDB answers with its most-submitted release instead. Intros and
+// recaps, timed from the start, still apply, but credits and previews, which
+// sit toward the end, would land in the wrong place.
+func sameRelease(resp *mediaResponse, duration time.Duration) bool {
+	if resp.GroupDurationMs == nil || *resp.GroupDurationMs <= 0 || duration <= 0 {
+		return true
+	}
+	diff := time.Duration(*resp.GroupDurationMs)*time.Millisecond - duration
+	return diff.Abs() <= releaseTolerance
+}
+
+// Each array entry is a separate occurrence; in particular, credits may
+// surround a scene to keep.
 func convertMarkers(stamps []segmentTimestamps, kind MarkerKind, totalDuration time.Duration) []Marker {
 	requireEnd := kind == MarkerKindIntro || kind == MarkerKindRecap
 	var markers []Marker
@@ -106,10 +128,12 @@ func validTimestamp(ms *int64) bool {
 	return ms == nil || (*ms >= 0 && *ms <= maxMilliseconds)
 }
 
-// TheIntroDB accepts a video duration from 5 minutes to 6 hours.
+// TheIntroDB accepts a video duration from 5 minutes to 6 hours, and no
+// timestamp past 6 hours.
 const (
 	minSubmitVideoDuration = 5 * time.Minute
 	maxSubmitVideoDuration = 6 * time.Hour
+	maxSubmitTimestamp     = 6 * time.Hour
 )
 
 // SubmitMarker contributes a single segment to TheIntroDB via POST /v4/submit,
@@ -120,7 +144,7 @@ func (p *Provider) SubmitMarker(ctx context.Context, req SubmissionRequest) (Sub
 	if p == nil || p.client == nil {
 		return SubmissionResult{}, fmt.Errorf("introdb: provider not configured")
 	}
-	target, ok := NewTarget(req.Kind, req.ExternalIDs, req.EpisodeExternalIDs, req.EpisodeTitle)
+	target, ok := NewTarget(req.Kind, req.ExternalIDs, req.Episode)
 	if !ok {
 		return SubmissionResult{}, fmt.Errorf("%w: submit requires a TVDB, TMDB, or IMDb id", ErrUnsubmittable)
 	}
@@ -150,24 +174,9 @@ func (p *Provider) SubmitMarker(ctx context.Context, req SubmissionRequest) (Sub
 		body.VideoDurationMs = &durMs
 	}
 
-	start, end := req.Start, req.End
-	switch req.Segment {
-	case MarkerKindIntro, MarkerKindRecap:
-		if start != nil && *start <= 0 {
-			start = nil // beginning of file
-		}
-	case MarkerKindCredits, MarkerKindPreview:
-		if end != nil && req.Duration > 0 && *end >= req.Duration {
-			end = nil // runs to end of file
-		}
-	}
-	if start != nil {
-		ms := int64(*start / time.Millisecond)
-		body.StartMs = &ms
-	}
-	if end != nil {
-		ms := int64(*end / time.Millisecond)
-		body.EndMs = &ms
+	body.StartMs, body.EndMs, err = submissionBounds(req, segment)
+	if err != nil {
+		return SubmissionResult{}, err
 	}
 
 	resp, err := p.client.submitSegment(ctx, body)
@@ -179,6 +188,50 @@ func (p *Provider) SubmitMarker(ctx context.Context, req SubmissionRequest) (Sub
 	}
 	s := resp.Submissions[0]
 	return SubmissionResult{ID: s.ID, Status: s.Status, Weight: s.Weight}, nil
+}
+
+// submissionBounds converts a segment to TheIntroDB's millisecond bounds. A
+// null start means the beginning of the file (intro, recap) and a null end the
+// end of it (credits, preview). TheIntroDB reads a zero intro or recap end, a
+// zero credits or preview start, and an empty range as a vote that the segment
+// is absent, so those are refused rather than sent.
+func submissionBounds(req SubmissionRequest, segment string) (start, end *int64, err error) {
+	start, end = roundedMilliseconds(req.Start), roundedMilliseconds(req.End)
+	switch req.Segment {
+	case MarkerKindIntro, MarkerKindRecap:
+		if start != nil && *start <= 0 {
+			start = nil
+		}
+		if end == nil || *end <= 0 {
+			return nil, nil, fmt.Errorf("%w: %s needs an end after the start of the file", ErrUnsubmittable, segment)
+		}
+	case MarkerKindCredits, MarkerKindPreview:
+		if durationMs := req.Duration.Round(time.Millisecond).Milliseconds(); end != nil && durationMs > 0 && *end >= durationMs {
+			end = nil
+		}
+		if start == nil || *start <= 0 {
+			return nil, nil, fmt.Errorf("%w: %s needs a start after the beginning of the file", ErrUnsubmittable, segment)
+		}
+	}
+	if start != nil && end != nil && *end <= *start {
+		return nil, nil, fmt.Errorf("%w: %s ends before it starts", ErrUnsubmittable, segment)
+	}
+	for _, bound := range []*int64{start, end} {
+		if bound != nil && *bound > maxSubmitTimestamp.Milliseconds() {
+			return nil, nil, fmt.Errorf("%w: %s runs past %s", ErrUnsubmittable, segment, maxSubmitTimestamp)
+		}
+	}
+	return start, end, nil
+}
+
+// roundedMilliseconds rounds to the nearest millisecond: Silo's seconds pass
+// through floating point, and truncating could turn 5 s into 4999 ms.
+func roundedMilliseconds(d *time.Duration) *int64 {
+	if d == nil {
+		return nil
+	}
+	ms := d.Round(time.Millisecond).Milliseconds()
+	return &ms
 }
 
 // FetchUserStats validates the configured key and returns contribution stats.

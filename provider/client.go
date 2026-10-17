@@ -35,13 +35,29 @@ const (
 	defaultBlockedCooldown = 5 * time.Minute
 )
 
-// TheIntroDB meters each request against a 10-second burst window: 30
-// lookups anonymously, 120 with an API key, and 40 submissions. The limiters
-// stay below those ceilings.
+// TheIntroDB meters each request against a 10-second burst window and reports
+// the lookup ceiling in X-RateLimit-Limit: 30 anonymously and, per its docs,
+// 120 with an API key. The lookup limiter starts below the anonymous ceiling
+// and then follows the reported one, so a key TheIntroDB does not accept
+// never raises the rate. Submissions allow 40 per window.
 const (
+	rateLimitWindow                           = 10 * time.Second
 	anonymousLookupRate, anonymousLookupBurst = rate.Limit(2), 5
-	keyedLookupRate, keyedLookupBurst         = rate.Limit(10), 10
 	writeRate, writeBurst                     = rate.Limit(3), 3
+)
+
+const (
+	// rejectedKeyBackoff is how long submissions with a key TheIntroDB
+	// refused are skipped without a request.
+	rejectedKeyBackoff = time.Hour
+	// exhaustedUsageBackoff stands in for the daily reset, which TheIntroDB
+	// reports as 0, once the daily budget is spent.
+	exhaustedUsageBackoff = time.Hour
+	// maxRetryDelay bounds a server-supplied delay to just over a day.
+	maxRetryDelay = 25 * time.Hour
+	// maxErrorReason bounds the response text kept in an error, which Silo
+	// stores per item.
+	maxErrorReason = 512
 )
 
 // Client is an HTTP client for the TheIntroDB v4 API. Each instance has its
@@ -51,6 +67,8 @@ type Client struct {
 	httpClient    *http.Client
 	mu            sync.RWMutex
 	apiKey        string
+	rejectedKey   string
+	rejectedUntil time.Time
 	baseURL       string
 	lookupLimiter *rate.Limiter
 	writeLimiter  *rate.Limiter
@@ -82,22 +100,60 @@ func (c *Client) SetBaseURL(u string) {
 }
 
 // SetAPIKey rotates the bearer token in-place. Safe to call concurrently
-// with in-flight requests; subsequent requests use the new key, cache, and
-// lookup budget.
+// with in-flight requests; subsequent requests use the new key and cache, and
+// the lookup rate starts over until responses report the new key's ceiling.
 func (c *Client) SetAPIKey(apiKey string) {
 	apiKey = strings.TrimSpace(apiKey)
 	c.mu.Lock()
-	if c.apiKey != apiKey {
-		c.apiKey = apiKey
-		c.cache = newResponseCache(maxCacheEntries)
+	defer c.mu.Unlock()
+	if c.apiKey == apiKey {
+		return
+	}
+	c.apiKey = apiKey
+	c.cache = newResponseCache(maxCacheEntries)
+	c.lookupLimiter.SetLimit(anonymousLookupRate)
+	c.lookupLimiter.SetBurst(anonymousLookupBurst)
+}
+
+// followRateLimit sizes the lookup limiter to the burst ceiling a lookup
+// response reports, keeping a fifth of it in reserve.
+func (c *Client) followRateLimit(headers http.Header) {
+	ceiling, err := strconv.Atoi(strings.TrimSpace(headers.Get("X-RateLimit-Limit")))
+	if err != nil || ceiling <= 0 {
+		return
+	}
+	limit := rate.Limit(float64(ceiling*4) / (5 * rateLimitWindow.Seconds()))
+	burst := max(1, ceiling/6)
+	if c.lookupLimiter.Limit() != limit {
+		c.lookupLimiter.SetLimit(limit)
+	}
+	if c.lookupLimiter.Burst() != burst {
+		c.lookupLimiter.SetBurst(burst)
+	}
+}
+
+// rejectKey remembers that TheIntroDB refused apiKey, unless it has since
+// been replaced.
+func (c *Client) rejectKey(apiKey string) {
+	c.mu.Lock()
+	if c.apiKey == apiKey {
+		c.rejectedKey, c.rejectedUntil = apiKey, time.Now().Add(rejectedKeyBackoff)
 	}
 	c.mu.Unlock()
-	limit, burst := anonymousLookupRate, anonymousLookupBurst
-	if apiKey != "" {
-		limit, burst = keyedLookupRate, keyedLookupBurst
+}
+
+func (c *Client) acceptKey(apiKey string) {
+	c.mu.Lock()
+	if c.rejectedKey == apiKey {
+		c.rejectedKey, c.rejectedUntil = "", time.Time{}
 	}
-	c.lookupLimiter.SetLimit(limit)
-	c.lookupLimiter.SetBurst(burst)
+	c.mu.Unlock()
+}
+
+func (c *Client) keyRejected(apiKey string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.rejectedKey == apiKey && time.Now().Before(c.rejectedUntil)
 }
 
 func (c *Client) invalidateCache() {
@@ -183,9 +239,16 @@ func (c *Client) fetchMedia(ctx context.Context, reqURL, apiKey string) (*mediaR
 		if err != nil {
 			return nil, fmt.Errorf("introdb: request failed: %w", err)
 		}
+		c.followRateLimit(resp.Header)
 
+		// TheIntroDB answers a miss with a JSON 404. Any other 404 means the
+		// endpoint itself is gone, which must not read as "no markers".
 		if resp.StatusCode == http.StatusNotFound {
+			isJSON := isJSONResponse(resp)
 			closeResponse(resp)
+			if !isJSON {
+				return nil, fmt.Errorf("introdb: lookup endpoint not found (HTTP 404)")
+			}
 			return nil, nil
 		}
 
@@ -213,9 +276,7 @@ func (c *Client) fetchMedia(ctx context.Context, reqURL, apiKey string) (*mediaR
 		}
 
 		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
-			closeResponse(resp)
-			return nil, fmt.Errorf("introdb: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+			return nil, fmt.Errorf("introdb: HTTP %d: %s", resp.StatusCode, errorReason(resp))
 		}
 
 		var out mediaResponse
@@ -253,9 +314,9 @@ func isCloudflareResponse(resp *http.Response) bool {
 // every queued lookup reach the block. The HTML block page is dropped; the
 // CF-Ray value is enough to diagnose it.
 func cloudflareBlockError(resp *http.Response) error {
-	message := fmt.Sprintf("introdb: Cloudflare blocked request (HTTP 403); retry after %s", defaultBlockedCooldown)
+	message := fmt.Sprintf("introdb: Cloudflare blocked request (HTTP %d); retry after %s", resp.StatusCode, defaultBlockedCooldown)
 	if ray := strings.TrimSpace(resp.Header.Get("CF-Ray")); ray != "" {
-		message = fmt.Sprintf("introdb: Cloudflare blocked request (HTTP 403, cf-ray %s); retry after %s", ray, defaultBlockedCooldown)
+		message = fmt.Sprintf("introdb: Cloudflare blocked request (HTTP %d, cf-ray %s); retry after %s", resp.StatusCode, ray, defaultBlockedCooldown)
 	}
 	return &RetryAfterError{RetryAfter: defaultBlockedCooldown, Message: message}
 }
@@ -299,6 +360,11 @@ func (c *Client) submitSegment(ctx context.Context, body submitRequest) (*submit
 	if apiKey == "" {
 		return nil, fmt.Errorf("introdb: submit requires an API key")
 	}
+	// Each candidate would draw the same refusal, so skip the request until
+	// the key changes or the backoff passes.
+	if c.keyRejected(apiKey) {
+		return nil, fmt.Errorf("introdb: submit skipped: TheIntroDB rejected this API key; use a key from theintrodb.org")
+	}
 
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -310,12 +376,8 @@ func (c *Client) submitSegment(ctx context.Context, body submitRequest) (*submit
 	}
 	defer closeResponse(resp)
 
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, rateLimitError(resp)
-	}
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
-		return nil, fmt.Errorf("introdb: submit HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, c.accountError("submit", resp, apiKey)
 	}
 
 	// Submissions affect authenticated lookups immediately. Replacing the cache
@@ -344,12 +406,8 @@ func (c *Client) fetchUserStats(ctx context.Context) (*userStatsResponse, error)
 	}
 	defer closeResponse(resp)
 
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, rateLimitError(resp)
-	}
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
-		return nil, fmt.Errorf("introdb: stats HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, c.accountError("stats", resp, apiKey)
 	}
 
 	var out userStatsResponse
@@ -359,7 +417,58 @@ func (c *Client) fetchUserStats(ctx context.Context) (*userStatsResponse, error)
 	if out.Error != "" {
 		return nil, fmt.Errorf("introdb: stats error: %s", out.Error)
 	}
+	c.acceptKey(apiKey)
 	return &out, nil
+}
+
+// accountError reads and closes a failed response from an endpoint that needs
+// the API key. Its text keeps the "introdb: <op> HTTP <status>: <reason>" form
+// Silo reads to tell refusals (400, 409, 422) from failures it retries.
+func (c *Client) accountError(op string, resp *http.Response, apiKey string) error {
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return rateLimitError(resp)
+	}
+	isJSON := isJSONResponse(resp)
+	if !isJSON && isCloudflareResponse(resp) && (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusServiceUnavailable) {
+		closeResponse(resp)
+		return cloudflareBlockError(resp)
+	}
+	status := resp.StatusCode
+	reason := errorReason(resp)
+	switch {
+	case status == http.StatusNotFound:
+		// v4 answers 404 only when the route itself is gone, which says
+		// nothing about the item.
+		return fmt.Errorf("introdb: %s endpoint not found (HTTP 404)", op)
+	case status == http.StatusServiceUnavailable:
+		// TheIntroDB could not check the account and asks to retry later.
+		after := min(retrySeconds(resp.Header.Get("Retry-After")), maxRetryDelay)
+		if after <= 0 {
+			after = defaultBlockedCooldown
+		}
+		return &RetryAfterError{RetryAfter: after, Message: fmt.Sprintf("introdb: %s HTTP 503: %s; retry after %s", op, reason, after)}
+	case isJSON && (status == http.StatusUnauthorized || status == http.StatusForbidden):
+		c.rejectKey(apiKey)
+	}
+	return fmt.Errorf("introdb: %s HTTP %d: %s", op, status, reason)
+}
+
+// errorReason reads and closes an error response, returning TheIntroDB's JSON
+// error message or a bounded excerpt of any other body.
+func errorReason(resp *http.Response) string {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+	closeResponse(resp)
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(body, &parsed) == nil && strings.TrimSpace(parsed.Error) != "" {
+		body = []byte(parsed.Error)
+	}
+	reason := strings.TrimSpace(string(body))
+	if len(reason) > maxErrorReason {
+		reason = strings.ToValidUTF8(reason[:maxErrorReason], "") + "…"
+	}
+	return reason
 }
 
 func (c *Client) do(ctx context.Context, limiter *rate.Limiter, method, endpoint string, body io.Reader, apiKey string) (*http.Response, error) {
@@ -400,21 +509,28 @@ func rateLimitError(resp *http.Response) error {
 
 // Daily usage headers accompany successful requests too. Only honor a reset
 // for an exhausted quota, or when the response omits its remaining count.
+// TheIntroDB reports the daily reset as 0, so a spent daily budget without a
+// usable reset or Retry-After waits exhaustedUsageBackoff.
 func retryDelay(headers http.Header, now time.Time) time.Duration {
 	after := retrySeconds(headers.Get("Retry-After"))
 	if date, err := http.ParseTime(headers.Get("Retry-After")); err == nil {
 		after = max(after, date.Sub(now))
 	}
 	for _, prefix := range []string{"X-UsageLimit-", "X-RateLimit-"} {
-		if remaining, err := strconv.ParseInt(headers.Get(prefix+"Remaining"), 10, 64); err == nil && remaining > 0 {
+		remaining, err := strconv.ParseInt(headers.Get(prefix+"Remaining"), 10, 64)
+		if err == nil && remaining > 0 {
 			continue
 		}
-		after = max(after, retrySeconds(headers.Get(prefix+"Reset")))
+		reset := retrySeconds(headers.Get(prefix + "Reset"))
+		if reset <= 0 && prefix == "X-UsageLimit-" && err == nil && remaining == 0 {
+			reset = exhaustedUsageBackoff
+		}
+		after = max(after, reset)
 	}
 	if after <= 0 {
 		return 10 * time.Second
 	}
-	return after
+	return min(after, maxRetryDelay)
 }
 
 func retrySeconds(value string) time.Duration {

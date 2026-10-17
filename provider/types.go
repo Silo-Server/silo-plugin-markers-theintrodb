@@ -46,16 +46,29 @@ const (
 )
 
 // Request describes one item to look up. For an episode, ExternalIDs names
-// the series and EpisodeExternalIDs the episode record Silo matched at
-// SeasonNumber/EpisodeNumber; season 0 holds specials.
+// the series, SeasonNumber/EpisodeNumber place the episode in Silo's
+// numbering (season 0 holds specials), and Episode describes it further.
 type Request struct {
-	Kind               ItemKind
-	ExternalIDs        map[string]string
-	SeasonNumber       int
-	EpisodeNumber      int
-	EpisodeExternalIDs map[string]string
-	EpisodeTitle       string
-	Duration           time.Duration
+	Kind          ItemKind
+	ExternalIDs   map[string]string
+	SeasonNumber  int
+	EpisodeNumber int
+	Episode       Episode
+	Duration      time.Duration
+}
+
+// Episode is what Silo knows about an episode beyond its series' IDs. All
+// fields are empty for a movie and on hosts that predate them.
+type Episode struct {
+	// ExternalIDs are the provider episode records Silo matched at the
+	// episode's numbers. Silo matches each provider's episodes by number
+	// alone, so two providers' IDs can name different episodes.
+	ExternalIDs map[string]string
+	// Numbering is the external ID key ("tvdb" or "tmdb") of the provider
+	// whose numbering the episode follows, or empty when Silo cannot tell.
+	Numbering string
+	// Title is in the library's metadata language.
+	Title string
 }
 
 type Result struct {
@@ -74,16 +87,15 @@ type Marker struct {
 // SubmissionRequest describes one segment to contribute. The item fields
 // follow Request.
 type SubmissionRequest struct {
-	Kind               ItemKind
-	ExternalIDs        map[string]string
-	SeasonNumber       int
-	EpisodeNumber      int
-	EpisodeExternalIDs map[string]string
-	EpisodeTitle       string
-	Segment            MarkerKind
-	Start              *time.Duration
-	End                *time.Duration
-	Duration           time.Duration
+	Kind          ItemKind
+	ExternalIDs   map[string]string
+	SeasonNumber  int
+	EpisodeNumber int
+	Episode       Episode
+	Segment       MarkerKind
+	Start         *time.Duration
+	End           *time.Duration
+	Duration      time.Duration
 }
 
 const (
@@ -132,14 +144,17 @@ func (e *RetryAfterError) Error() string {
 // as empty slices via Go's zero-value semantics. The episode-list fallback
 // TheIntroDB sends for media without submissions decodes to no segments.
 type mediaResponse struct {
-	TvdbID  int                 `json:"tvdb_id"`
-	Type    string              `json:"type"`
-	Season  *int                `json:"season,omitempty"`
-	Episode *int                `json:"episode,omitempty"`
-	Intro   []segmentTimestamps `json:"intro,omitempty"`
-	Recap   []segmentTimestamps `json:"recap,omitempty"`
-	Credits []segmentTimestamps `json:"credits,omitempty"`
-	Preview []segmentTimestamps `json:"preview,omitempty"`
+	TvdbID int    `json:"tvdb_id"`
+	Type   string `json:"type"`
+	// GroupDurationMs is the duration of the release whose timestamps the
+	// response carries; present with details when that duration is known.
+	GroupDurationMs *int64              `json:"group_duration_ms,omitempty"`
+	Season          *int                `json:"season,omitempty"`
+	Episode         *int                `json:"episode,omitempty"`
+	Intro           []segmentTimestamps `json:"intro,omitempty"`
+	Recap           []segmentTimestamps `json:"recap,omitempty"`
+	Credits         []segmentTimestamps `json:"credits,omitempty"`
+	Preview         []segmentTimestamps `json:"preview,omitempty"`
 }
 
 // segmentTimestamps is the per-occurrence shape returned by TheIntroDB.

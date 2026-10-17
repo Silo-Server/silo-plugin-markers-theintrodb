@@ -10,25 +10,31 @@ Each request addresses TheIntroDB by one ID, because TheIntroDB reads season
 and episode numbers in the space of the ID it receives:
 
 - A movie uses its TVDB ID, then TMDB, then IMDb.
-- An episode whose row in Silo came from TVDB alone (a TVDB episode ID and no
-  TMDB episode ID) uses TVDB's numbers, so it is addressed by the series' TVDB
-  ID with `tvdb_episode_id` and the episode title as hints.
-- Every other episode may follow TMDB's numbering, since Silo matches
-  providers' episodes by number alone. It uses the series' TMDB ID, so
-  TheIntroDB converts TMDB numbering, then TVDB, then IMDb.
+- An episode uses the series ID of the provider whose numbering it follows,
+  which Silo reports as `episode_numbering`: the first TVDB or TMDB provider in
+  the library's episode chain that supplied the episode. A TVDB-numbered
+  episode also sends its TVDB episode ID as `tvdb_episode_id`.
+- On a host that predates `episode_numbering`, an episode Silo matched on TVDB
+  alone is treated as TVDB-numbered, and any other episode uses the series'
+  TMDB ID so TheIntroDB converts TMDB numbering.
 
-Seasons above 1000 and episodes above 10000, which TheIntroDB refuses, are
-not looked up, and submissions it can never accept are reported to Silo as
-permanent refusals.
+Malformed IDs, seasons above 1000, and episodes above 10000 are not looked up.
+Lookups ask for TheIntroDB's per-segment confidence and submission count. When
+TheIntroDB answers with a release more than five minutes longer or shorter than
+the file, its credits and previews are dropped, since they would land in the
+wrong place; intros and recaps are kept.
 
-Malformed IDs are skipped. Lookups ask for TheIntroDB's per-segment confidence
-and submission count and pass them to Silo. Lookups work without an account;
-submissions and account statistics need an API key from theintrodb.org.
+Submissions that TheIntroDB would read as "no segment" (credits or a preview
+starting at 0, an intro or recap ending at 0, an empty range) or cannot accept
+are refused locally, and Silo records them as permanent refusals. After
+TheIntroDB rejects the API key, submissions stop for an hour or until the key
+changes or validates.
 
 Each returned segment is preserved, including separate credits ranges around a
 mid-credits scene. Lookup responses are cached for up to 24 hours in a bounded
-cache; changing credentials or submitting a marker clears that cache. Quota
-responses include the upstream reset delay so Silo can schedule the next
+cache; changing credentials or submitting a marker clears that cache. The
+lookup rate follows the ceiling TheIntroDB reports in `X-RateLimit-Limit`.
+Quota responses include the upstream reset delay so Silo can schedule the next
 lookup. Reaching TheIntroDB's daily limit for a single title fails only that
 lookup instead of pausing the provider.
 
