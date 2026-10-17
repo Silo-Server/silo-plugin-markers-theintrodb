@@ -108,6 +108,12 @@ func convertMarkers(stamps []segmentTimestamps, kind MarkerKind, totalDuration t
 		if !requireEnd && (s.StartMs == nil || start == 0) {
 			continue
 		}
+		// Credits and previews run to the end of the release they were timed
+		// on, so one that ends a little past this file still ends with it.
+		// Silo stores whole-second durations, which makes this common.
+		if !requireEnd && totalDuration > 0 && start < totalDuration && end > totalDuration && end-totalDuration <= releaseTolerance {
+			end = totalDuration
+		}
 		if end <= start || (totalDuration > 0 && end > totalDuration) {
 			continue
 		}

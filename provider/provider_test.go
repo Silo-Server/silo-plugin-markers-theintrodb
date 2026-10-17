@@ -220,3 +220,22 @@ func TestProviderDropsEndSegmentsFromAnotherRelease(t *testing.T) {
 		})
 	}
 }
+
+func TestProviderEndsEndSegmentsWithTheFile(t *testing.T) {
+	// TheIntroDB's credits end a second past the file, which Silo measures in
+	// whole seconds; an intro ending past the file is still nonsense.
+	p := newProvider(t, `{"tvdb_id":121361,"type":"tv","season":8,"episode":1,"group_duration_ms":3183000,
+		"intro":[{"start_ms":3180000,"end_ms":3190000}],
+		"credits":[{"start_ms":3108700,"end_ms":3188000}],
+		"preview":[{"start_ms":3150000,"end_ms":3600000}]}`)
+	req := episodeReq(map[string]string{ExternalIDKeyTVDB: "121361"})
+	req.Duration = 3187 * time.Second
+	res, err := p.FetchMarkers(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Marker{{Kind: MarkerKindCredits, Start: 3108700 * time.Millisecond, End: 3187 * time.Second, Confidence: defaultConfidence, Algorithm: Algorithm}}
+	if !reflect.DeepEqual(res.Markers, want) {
+		t.Fatalf("markers = %+v, want only the credits, ending with the file", res.Markers)
+	}
+}
