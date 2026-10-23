@@ -16,8 +16,10 @@ const ProviderID = "introdb"
 const Algorithm = "introdb:v4"
 
 // defaultConfidence stands in when a response omits TheIntroDB's own
-// per-segment confidence.
-const defaultConfidence = 0.9
+// per-segment confidence or sends one outside 0-1. Silo picks the most
+// confident online marker, so such a segment is used only when no rated
+// marker competes with it.
+const defaultConfidence = 0
 
 // DefaultBaseURL is the production TheIntroDB v4 endpoint. Overridable
 // in tests via Client.SetBaseURL.

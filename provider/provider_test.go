@@ -136,8 +136,9 @@ func TestProviderUsesTheIntroDBConfidence(t *testing.T) {
 	}
 	want := []Marker{
 		{Kind: MarkerKindIntro, Start: 436 * time.Second, End: 535 * time.Second, Confidence: 0.67, SubmissionCount: 5, Algorithm: Algorithm},
-		// Out-of-range details fall back to the default policy.
-		{Kind: MarkerKindCredits, Start: 1700 * time.Second, End: 1800 * time.Second, Confidence: defaultConfidence, Algorithm: Algorithm},
+		// Out-of-range details fall back to the default policy: no
+		// confidence, so any rated marker outranks it.
+		{Kind: MarkerKindCredits, Start: 1700 * time.Second, End: 1800 * time.Second, Confidence: 0, Algorithm: Algorithm},
 	}
 	if !reflect.DeepEqual(res.Markers, want) {
 		t.Fatalf("markers = %+v, want %+v", res.Markers, want)

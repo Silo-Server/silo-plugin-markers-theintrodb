@@ -69,8 +69,8 @@ func TestMarkerServerFetchMarkersMapsSegments(t *testing.T) {
 		if got.GetSegment() != expected.segment || got.StartSeconds == nil || got.EndSeconds == nil || got.GetStartSeconds() != expected.start || got.GetEndSeconds() != expected.end {
 			t.Errorf("marker %d = %+v, want %s %v–%v", i, got, expected.segment, expected.start, expected.end)
 		}
-		if got.GetConfidence() != 0.9 || got.GetSubmissionCount() != 0 || got.GetAlgorithm() != provider.Algorithm {
-			t.Errorf("marker %d metadata = %+v, want default confidence, no submission count, and %q", i, got, provider.Algorithm)
+		if got.GetConfidence() != 0 || got.GetSubmissionCount() != 0 || got.GetAlgorithm() != provider.Algorithm {
+			t.Errorf("marker %d metadata = %+v, want no confidence or submission count, and %q", i, got, provider.Algorithm)
 		}
 	}
 }
