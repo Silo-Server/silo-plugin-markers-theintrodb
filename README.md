@@ -22,7 +22,8 @@ Malformed IDs, seasons above 1000, and episodes above 10000 are not looked up.
 Lookups ask for TheIntroDB's per-segment confidence and submission count. A
 segment without a confidence (or with one outside 0-1) is reported with
 confidence 0, so it ranks below any rated marker and Silo uses it only when no
-other provider has a marker for that section. When
+other provider has a marker for that section. A fetch confidence floor above 0
+on this provider drops such segments entirely. When
 TheIntroDB answers with a release more than five minutes longer or shorter than
 the file, its credits and previews are dropped, since they would land in the
 wrong place; intros and recaps are kept.
