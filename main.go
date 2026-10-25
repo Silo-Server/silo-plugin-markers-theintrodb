@@ -361,6 +361,25 @@ func (s *httpRoutesServer) handleReport(ctx context.Context, req *pluginv1.Handl
 			"error": "one of tvdb_id, tmdb_id or imdb_id is required",
 		})
 	}
+	// The identifiers are held to the same rules the lookup and submit paths use, so this
+	// route cannot forward an id the plugin would itself have dropped. Otherwise an empty
+	// IMDb id, or a nonpositive or out-of-range numeric one, reaches TheIntroDB and comes
+	// back as an upstream refusal instead of as the caller's mistake.
+	if body.TVDBID != nil && provider.CanonicalNumericID(provider.ExternalIDKeyTVDB, int64(*body.TVDBID)) == 0 {
+		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
+			"error": "tvdb_id must be an identifier TheIntroDB accepts",
+		})
+	}
+	if body.TMDBID != nil && provider.CanonicalNumericID(provider.ExternalIDKeyTMDB, int64(*body.TMDBID)) == 0 {
+		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
+			"error": "tmdb_id must be an identifier TheIntroDB accepts",
+		})
+	}
+	if body.IMDBID != nil && provider.CanonicalIMDbID(*body.IMDBID) == "" {
+		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
+			"error": "imdb_id must be an identifier like tt0133093",
+		})
+	}
 	if mediaType == "tv" && (body.Season == nil || body.Episode == nil) {
 		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
 			"error": "season and episode are required to report an episode",
@@ -383,6 +402,13 @@ func (s *httpRoutesServer) handleReport(ctx context.Context, req *pluginv1.Handl
 		if errors.As(err, &conflict) {
 			return jsonRouteResponse(http.StatusConflict, map[string]string{"message": conflict.Message})
 		}
+		// A provider-wide block belongs to the host rather than to this reply. The typed
+		// contract carries the delay, so the shared cooldown is set once for every
+		// consumer instead of being flattened into a status and rediscovered.
+		var retryErr *provider.RetryAfterError
+		if errors.As(err, &retryErr) {
+			return nil, providerError(err)
+		}
 		return jsonRouteResponse(statusForFlagError(err), map[string]string{"error": err.Error()})
 	}
 
@@ -395,11 +421,9 @@ func (s *httpRoutesServer) handleReport(ctx context.Context, req *pluginv1.Handl
 
 // statusForFlagError maps TheIntroDB's failure modes onto the status the host
 // should hand back, so a client can tell "try later" from "this will not work".
+// A provider-wide block does not come through here: it is reported through the
+// host's typed retry contract so the cooldown and its delay survive.
 func statusForFlagError(err error) int {
-	var retryErr *provider.RetryAfterError
-	if errors.As(err, &retryErr) {
-		return http.StatusTooManyRequests
-	}
 	// No key configured is the server's gap, not something the caller did.
 	if strings.Contains(err.Error(), "requires an API key") {
 		return http.StatusServiceUnavailable
