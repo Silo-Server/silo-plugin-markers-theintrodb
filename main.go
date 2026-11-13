@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -114,6 +116,7 @@ func main() {
 		Servers: runtime.CapabilityServers{
 			Runtime:        rt,
 			MarkerProvider: &markerServer{runtime: rt},
+			HttpRoutes:     &httpRoutesServer{runtime: rt},
 		},
 	})
 }
@@ -136,6 +139,21 @@ func loadManifest() (*pluginv1.PluginManifest, error) {
 	}
 	checksum := sha256.Sum256(binaryData)
 	manifest.Checksum = hex.EncodeToString(checksum[:])
+
+	// Routes are registered here rather than declared in the manifest JSON: the
+	// descriptor has to name the handler's path, and keeping both in one place
+	// means they cannot drift.
+	if err := publicmanifest.RegisterHTTPRoutes(manifest, &pluginv1.HttpRouteDescriptor{
+		Id:     "report",
+		Method: http.MethodPost,
+		Path:   reportRoutePath,
+		// Reports are per-account and act on TheIntroDB's data, so the route
+		// needs a signed-in caller and is not part of the public surface.
+		Access:    "authenticated",
+		Navigable: false,
+	}); err != nil {
+		return nil, fmt.Errorf("register plugin routes: %w", err)
+	}
 	return manifest, nil
 }
 
@@ -281,4 +299,173 @@ func providerError(err error) error {
 		return st.Err()
 	}
 	return withDetails.Err()
+}
+
+// reportRoutePath is the path the report route is served on, relative to the
+// plugin's mount on the host. The descriptor in loadManifest names it too, so
+// the two cannot disagree.
+const reportRoutePath = "/report"
+
+// reportRequestBody is what a client posts to the report route. It mirrors the
+// addressing the plugin's markers arrive with: whichever identifiers the host
+// knows the title by, plus the season and episode for a series.
+type reportRequestBody struct {
+	Type    string  `json:"type"`
+	TVDBID  *int    `json:"tvdb_id,omitempty"`
+	TMDBID  *int    `json:"tmdb_id,omitempty"`
+	IMDBID  *string `json:"imdb_id,omitempty"`
+	Season  *int    `json:"season,omitempty"`
+	Episode *int    `json:"episode,omitempty"`
+	Mapping string  `json:"mapping,omitempty"`
+}
+
+// httpRoutesServer serves the routes this plugin exposes to the host. They are
+// reached through the host rather than directly by the browser, which is what
+// keeps the configured API key on the server: the viewer's client calls Silo,
+// Silo calls this, and this process is the only thing that ever holds the key.
+type httpRoutesServer struct {
+	pluginv1.UnimplementedHttpRoutesServer
+	runtime *runtimeServer
+}
+
+// Handle serves the routes this plugin exposes to the host. Only the report route
+// is served here: a path this plugin does not expose answers 404 rather than
+// falling through to the host to interpret.
+func (s *httpRoutesServer) Handle(ctx context.Context, req *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	if strings.EqualFold(req.GetMethod(), http.MethodPost) && req.GetPath() == reportRoutePath {
+		return s.handleReport(ctx, req)
+	}
+	return jsonRouteResponse(http.StatusNotFound, map[string]string{
+		"error": "no such plugin route",
+	})
+}
+
+// countReportIdentifiers counts the identifiers a report addresses its media by.
+// The route accepts exactly one; see the check in handleReport for why.
+func countReportIdentifiers(body reportRequestBody) int {
+	count := 0
+	for _, present := range []bool{body.TVDBID != nil, body.TMDBID != nil, body.IMDBID != nil} {
+		if present {
+			count++
+		}
+	}
+	return count
+}
+
+// handleReport forwards a viewer's report to TheIntroDB.
+//
+// The body is validated here as well as on TheIntroDB's side: this route takes
+// input from any authenticated account, and checking it before the round trip
+// turns a remote refusal into a message the viewer can act on.
+func (s *httpRoutesServer) handleReport(ctx context.Context, req *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
+	var body reportRequestBody
+	if err := json.Unmarshal(req.GetBody(), &body); err != nil {
+		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
+			"error": "the request body must be a JSON object",
+		})
+	}
+
+	mediaType := strings.ToLower(strings.TrimSpace(body.Type))
+	if mediaType != "movie" && mediaType != "tv" {
+		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
+			"error": `type must be "movie" or "tv"`,
+		})
+	}
+	if body.TVDBID == nil && body.TMDBID == nil && body.IMDBID == nil {
+		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
+			"error": "one of tvdb_id, tmdb_id or imdb_id is required",
+		})
+	}
+	// One identifier, never several. TheIntroDB reads a season and episode in the
+	// numbering of the id it is given and prefers TVDB over TMDB, so a report carrying
+	// both could flag a different episode than the one the viewer is watching — and a
+	// flag is settled. The host's client sends the single id the item was matched by,
+	// which is the id its season and episode are already numbered in; this route has no
+	// numbering of its own to select on, so it refuses rather than guesses.
+	if countReportIdentifiers(body) > 1 {
+		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
+			"error": "send only one of tvdb_id, tmdb_id or imdb_id",
+		})
+	}
+	// The identifiers are held to the same rules the lookup and submit paths use, so this
+	// route cannot forward an id the plugin would itself have dropped. Otherwise an empty
+	// IMDb id, or a nonpositive or out-of-range numeric one, reaches TheIntroDB and comes
+	// back as an upstream refusal instead of as the caller's mistake.
+	if body.TVDBID != nil && provider.CanonicalNumericID(provider.ExternalIDKeyTVDB, int64(*body.TVDBID)) == 0 {
+		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
+			"error": "tvdb_id must be an identifier TheIntroDB accepts",
+		})
+	}
+	if body.TMDBID != nil && provider.CanonicalNumericID(provider.ExternalIDKeyTMDB, int64(*body.TMDBID)) == 0 {
+		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
+			"error": "tmdb_id must be an identifier TheIntroDB accepts",
+		})
+	}
+	if body.IMDBID != nil && provider.CanonicalIMDbID(*body.IMDBID) == "" {
+		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
+			"error": "imdb_id must be an identifier like tt0133093",
+		})
+	}
+	if mediaType == "tv" && (body.Season == nil || body.Episode == nil) {
+		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
+			"error": "season and episode are required to report an episode",
+		})
+	}
+
+	result, err := s.runtime.client.FlagVote(ctx, provider.FlagRequest{
+		TVDBID:  body.TVDBID,
+		TMDBID:  body.TMDBID,
+		IMDBID:  body.IMDBID,
+		Type:    mediaType,
+		Season:  body.Season,
+		Episode: body.Episode,
+		Mapping: strings.TrimSpace(body.Mapping),
+	})
+	if err != nil {
+		// A repeat report is a settled outcome: the viewer is told the segment
+		// is already known about rather than shown a failure.
+		var conflict *provider.FlagConflictError
+		if errors.As(err, &conflict) {
+			return jsonRouteResponse(http.StatusConflict, map[string]string{"message": conflict.Message})
+		}
+		// A provider-wide block belongs to the host rather than to this reply. The typed
+		// contract carries the delay, so the shared cooldown is set once for every
+		// consumer instead of being flattened into a status and rediscovered.
+		var retryErr *provider.RetryAfterError
+		if errors.As(err, &retryErr) {
+			return nil, providerError(err)
+		}
+		return jsonRouteResponse(statusForFlagError(err), map[string]string{"error": err.Error()})
+	}
+
+	message := result.Message
+	if strings.TrimSpace(message) == "" {
+		message = "Thanks — TheIntroDB will review this segment."
+	}
+	return jsonRouteResponse(http.StatusOK, map[string]string{"message": message})
+}
+
+// statusForFlagError maps TheIntroDB's failure modes onto the status the host
+// should hand back, so a client can tell "try later" from "this will not work".
+// A provider-wide block does not come through here: it is reported through the
+// host's typed retry contract so the cooldown and its delay survive.
+func statusForFlagError(err error) int {
+	// No key configured is the server's gap, not something the caller did.
+	if strings.Contains(err.Error(), "requires an API key") {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
+}
+
+// jsonRouteResponse encodes a route reply, which is how the host receives it.
+func jsonRouteResponse(status int, payload any) (*pluginv1.HandleHTTPResponse, error) {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return &pluginv1.HandleHTTPResponse{
+		StatusCode: int32(status),
+		Headers:    map[string]string{"Content-Type": "application/json"},
+		Body:       encoded,
+	}, nil
 }

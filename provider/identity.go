@@ -25,6 +25,36 @@ func validCoordinates(season, episode int) bool {
 
 var imdbIDPattern = regexp.MustCompile(`^tt[0-9]{7,8}$`)
 
+// CanonicalIMDbID returns value as the provider accepts it, or "" when it is not an
+// IMDb id. NewTarget applies the same rule, so a caller that checks with this cannot
+// forward an id the plugin would itself have dropped.
+func CanonicalIMDbID(value string) string {
+	id := strings.TrimSpace(value)
+	if !imdbIDPattern.MatchString(id) {
+		return ""
+	}
+	return id
+}
+
+// CanonicalNumericID returns id in the form the provider accepts for key (tvdb or
+// tmdb), or 0 when it is not one: the lookup and submit paths apply the same bound, so
+// a caller that checks with this cannot forward an id the plugin would have discarded.
+func CanonicalNumericID(key string, id int64) int64 {
+	limit := int64(0)
+	switch key {
+	case ExternalIDKeyTVDB:
+		limit = maxTVDBID
+	case ExternalIDKeyTMDB:
+		limit = maxTMDBID
+	default:
+		return 0
+	}
+	if id <= 0 || id > limit {
+		return 0
+	}
+	return id
+}
+
 // Target is the one media ID a request addresses TheIntroDB by, plus the
 // optional hints that refine a TV episode. TheIntroDB reads season and episode
 // numbers in the space of the ID it is given: TVDB's default order for

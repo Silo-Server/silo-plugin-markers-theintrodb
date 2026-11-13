@@ -391,6 +391,96 @@ func (c *Client) submitSegment(ctx context.Context, body submitRequest) (*submit
 	return &out, nil
 }
 
+// FlagRequest is the body of POST /v4/flag-vote: which media is wrong and,
+// for a series, which episode. At least one identifier is required; the type
+// tells the API whether Season/Episode apply.
+type FlagRequest struct {
+	TVDBID  *int    `json:"tvdb_id,omitempty"`
+	TMDBID  *int    `json:"tmdb_id,omitempty"`
+	IMDBID  *string `json:"imdb_id,omitempty"`
+	Type    string  `json:"type"`
+	Season  *int    `json:"season,omitempty"`
+	Episode *int    `json:"episode,omitempty"`
+	Mapping string  `json:"mapping,omitempty"`
+}
+
+// FlagResponse is the API's acknowledgement of a flag.
+type FlagResponse struct {
+	Message string `json:"message"`
+}
+
+// FlagConflictError reports that TheIntroDB already holds a flag for this
+// media, which is a settled outcome rather than a failure.
+type FlagConflictError struct{ Message string }
+
+func (e *FlagConflictError) Error() string { return e.Message }
+
+// FlagVote reports an incorrect segment via POST /v4/flag-vote.
+//
+// The key used is the one the SERVER configured, so the report is attributed to
+// the server's TheIntroDB account. It is deliberately not the viewer's own key:
+// the viewer is not asked for one, and a server-wide secret must never be handed
+// to a browser. On 429 the usage-limit reset is surfaced in the error, as it is
+// for a submission.
+func (c *Client) FlagVote(ctx context.Context, body FlagRequest) (*FlagResponse, error) {
+	c.mu.RLock()
+	baseURL := c.baseURL
+	apiKey := c.apiKey
+	c.mu.RUnlock()
+	if apiKey == "" {
+		return nil, fmt.Errorf("introdb: flag requires an API key")
+	}
+	// Each report would draw the same refusal, so skip the request until the key
+	// changes or the backoff passes.
+	if c.keyRejected(apiKey) {
+		return nil, fmt.Errorf("introdb: flag skipped: TheIntroDB rejected this API key; use a key from theintrodb.org")
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("introdb: marshal flag: %w", err)
+	}
+	resp, err := c.do(ctx, c.writeLimiter, http.MethodPost, baseURL+"/flag-vote", bytes.NewReader(payload), apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("introdb: flag request failed: %w", err)
+	}
+	defer closeResponse(resp)
+
+	if resp.StatusCode == http.StatusConflict {
+		return nil, &FlagConflictError{Message: decodeMessage(resp.Body)}
+	}
+	if resp.StatusCode >= 400 {
+		return nil, c.accountError("flag", resp, apiKey)
+	}
+
+	var out FlagResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(&out); err != nil {
+		// The write already happened; an unreadable acknowledgement is not a
+		// reason to report a failure to the viewer.
+		return &FlagResponse{}, nil
+	}
+	return &out, nil
+}
+
+// decodeMessage reads the API's {"message": ...} error body, falling back to a
+// generic line when it cannot be read.
+func decodeMessage(body io.Reader) string {
+	var payload struct {
+		Message string `json:"message"`
+		Error   string `json:"error"`
+	}
+	if err := json.NewDecoder(io.LimitReader(body, maxResponseBody)).Decode(&payload); err != nil {
+		return "TheIntroDB has already been told about this segment"
+	}
+	if payload.Message != "" {
+		return payload.Message
+	}
+	if payload.Error != "" {
+		return payload.Error
+	}
+	return "TheIntroDB has already been told about this segment"
+}
+
 // fetchUserStats validates the configured key and returns contribution stats
 // via GET /v4/user/stats.
 func (c *Client) fetchUserStats(ctx context.Context) (*userStatsResponse, error) {
