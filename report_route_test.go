@@ -86,6 +86,65 @@ func TestReportRouteRefusesIdentifiersTheProviderWouldDiscard(t *testing.T) {
 	}
 }
 
+// A report addresses one media by one identity. TheIntroDB reads season and episode in
+// the numbering of the id it is given and prefers TVDB over TMDB, so a body carrying two
+// ids could flag an episode the viewer is not watching — and a flag is settled, so there
+// is nothing to undo afterwards. This route has no numbering of its own to select on, so
+// it refuses the ambiguity instead of letting the provider's precedence decide.
+func TestReportRouteRefusesTwoIdentifiersAtOnce(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"tvdb and tmdb", `{"type":"tv","tvdb_id":73871,"tmdb_id":1399,"season":7,"episode":1}`},
+		{"tvdb and imdb", `{"type":"movie","tvdb_id":73871,"imdb_id":"tt0133093"}`},
+		{"tmdb and imdb", `{"type":"movie","tmdb_id":603,"imdb_id":"tt0133093"}`},
+		{"all three", `{"type":"tv","tvdb_id":73871,"tmdb_id":1399,"imdb_id":"tt0133093","season":7,"episode":1}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			route, calls := reportRouteFor(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}, "configured-key")
+
+			resp, err := route.Handle(context.Background(), reportCall(tc.body))
+			if err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if got := resp.GetStatusCode(); got != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %s)", got, resp.GetBody())
+			}
+			if !strings.Contains(string(resp.GetBody()), "send only one of") {
+				t.Fatalf("body = %s, want it to name the ambiguity", resp.GetBody())
+			}
+			if *calls != 0 {
+				t.Fatalf("TheIntroDB was called %d time(s); the ambiguous body should have been refused first", *calls)
+			}
+		})
+	}
+}
+
+// One identity stays valid, including the pair of coordinates an episode needs.
+func TestReportRouteAcceptsOneIdentifier(t *testing.T) {
+	route, calls := reportRouteFor(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"message":"Thanks"}`))
+	}, "configured-key")
+
+	resp, err := route.Handle(context.Background(),
+		reportCall(`{"type":"tv","tvdb_id":73871,"season":7,"episode":1,"mapping":"dvd"}`))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := resp.GetStatusCode(); got != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", got, resp.GetBody())
+	}
+	if *calls != 1 {
+		t.Fatalf("TheIntroDB was called %d time(s), want 1", *calls)
+	}
+}
+
 // A provider-wide block belongs to the host, not to this reply: the delay has to
 // survive on the typed contract so every consumer shares one cooldown instead of each
 // rediscovering it from a status.

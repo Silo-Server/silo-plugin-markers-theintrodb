@@ -340,6 +340,18 @@ func (s *httpRoutesServer) Handle(ctx context.Context, req *pluginv1.HandleHTTPR
 	})
 }
 
+// countReportIdentifiers counts the identifiers a report addresses its media by.
+// The route accepts exactly one; see the check in handleReport for why.
+func countReportIdentifiers(body reportRequestBody) int {
+	count := 0
+	for _, present := range []bool{body.TVDBID != nil, body.TMDBID != nil, body.IMDBID != nil} {
+		if present {
+			count++
+		}
+	}
+	return count
+}
+
 // handleReport forwards a viewer's report to TheIntroDB.
 //
 // The body is validated here as well as on TheIntroDB's side: this route takes
@@ -362,6 +374,17 @@ func (s *httpRoutesServer) handleReport(ctx context.Context, req *pluginv1.Handl
 	if body.TVDBID == nil && body.TMDBID == nil && body.IMDBID == nil {
 		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
 			"error": "one of tvdb_id, tmdb_id or imdb_id is required",
+		})
+	}
+	// One identifier, never several. TheIntroDB reads a season and episode in the
+	// numbering of the id it is given and prefers TVDB over TMDB, so a report carrying
+	// both could flag a different episode than the one the viewer is watching — and a
+	// flag is settled. The host's client sends the single id the item was matched by,
+	// which is the id its season and episode are already numbered in; this route has no
+	// numbering of its own to select on, so it refuses rather than guesses.
+	if countReportIdentifiers(body) > 1 {
+		return jsonRouteResponse(http.StatusBadRequest, map[string]string{
+			"error": "send only one of tvdb_id, tmdb_id or imdb_id",
 		})
 	}
 	// The identifiers are held to the same rules the lookup and submit paths use, so this
