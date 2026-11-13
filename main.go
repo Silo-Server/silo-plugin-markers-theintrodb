@@ -328,6 +328,9 @@ type httpRoutesServer struct {
 	runtime *runtimeServer
 }
 
+// Handle serves the routes this plugin exposes to the host. Only the report route
+// is served here: a path this plugin does not expose answers 404 rather than
+// falling through to the host to interpret.
 func (s *httpRoutesServer) Handle(ctx context.Context, req *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
 	if strings.EqualFold(req.GetMethod(), http.MethodPost) && req.GetPath() == reportRoutePath {
 		return s.handleReport(ctx, req)

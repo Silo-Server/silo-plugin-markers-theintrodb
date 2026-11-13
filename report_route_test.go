@@ -35,6 +35,8 @@ func reportRouteFor(t *testing.T, handler http.HandlerFunc, apiKey string) (*htt
 	}, &calls
 }
 
+// reportCall builds the request a client sends to the route, so a test body can be
+// posted without restating the descriptor's method and path in every case.
 func reportCall(body string) *pluginv1.HandleHTTPRequest {
 	return &pluginv1.HandleHTTPRequest{
 		Method: http.MethodPost,

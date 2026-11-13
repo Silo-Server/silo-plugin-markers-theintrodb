@@ -52,6 +52,10 @@ func TestFlagVoteAddressesTheIntroDBWithTheConfiguredKey(t *testing.T) {
 	}
 }
 
+// A repeat flag is a settled outcome and not a failure: TheIntroDB keys one vote
+// per account per media, so the caller is told the segment is already known about.
+// A provider-wide block is the opposite — its delay has to survive on the typed
+// contract — and the two are checked here not to be confused with one another.
 func TestFlagVoteMapsRepeatFlagsAndProviderBlocks(t *testing.T) {
 	t.Run("a repeat flag is a settled outcome, not a failure", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
