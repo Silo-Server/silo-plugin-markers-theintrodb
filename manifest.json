@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.theintrodb",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "presentation": {
@@ -19,6 +19,14 @@
   "supported_platforms": [
     {
       "os": "darwin",
+      "arch": "arm64"
+    },
+    {
+      "os": "freebsd",
+      "arch": "amd64"
+    },
+    {
+      "os": "freebsd",
       "arch": "arm64"
     },
     {
