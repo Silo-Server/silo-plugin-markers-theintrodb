@@ -33,6 +33,14 @@ episodes have and the separate credits ranges that surround a scene to keep: a
 range is only discarded when it cannot belong to the file, such as an intro
 ending past its end or a credits range that its release's length cannot place.
 
+TheIntroDB answers "this item has no segment of that kind" with a single entry
+whose bounds are both absent or zero, which is about existence rather than
+position. The plugin reports that as an absent answer — the same shape Silo
+stores when an operator clears a marker — only when the host asks for one
+(`accepts_absent`), because a host that predates the flag reads a marker without
+bounds as covering the whole file. A host without it is told nothing, as
+before.
+
 Submissions that TheIntroDB would read as "no segment" (credits or a preview
 starting at 0, an intro or recap ending at 0, an empty range) or cannot accept
 are refused locally, and Silo records them as permanent refusals. Refusing a

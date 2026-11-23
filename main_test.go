@@ -150,6 +150,49 @@ func TestMarkerServerSubmitRateLimitMapsRetryInfo(t *testing.T) {
 
 func floatPtr(v float64) *float64 { return &v }
 
+func TestMarkerServerReportsNoSegmentAsAnAbsentSegment(t *testing.T) {
+	server := testMarkerServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"tvdb_id":78857,"type":"tv","season":1,"episode":1,
+			"recap":[{"start_ms":0,"end_ms":0,"confidence":0.6,"submission_count":1}]}`))
+	}, "")
+	request := func(acceptsAbsent bool) *pluginv1.FetchMarkersRequest {
+		return &pluginv1.FetchMarkersRequest{
+			ItemType:        "episode",
+			ExternalIds:     &pluginv1.MarkerExternalIDs{TvdbId: "78857"},
+			SeasonNumber:    1,
+			EpisodeNumber:   1,
+			DurationSeconds: 1416,
+			AcceptsAbsent:   acceptsAbsent,
+		}
+	}
+
+	resp, err := server.FetchMarkers(context.Background(), request(true))
+	if err != nil {
+		t.Fatalf("FetchMarkers: %v", err)
+	}
+	markers := resp.GetMarkers()
+	if len(markers) != 1 {
+		t.Fatalf("markers = %+v, want TheIntroDB's no-segment answer reported", markers)
+	}
+	marker := markers[0]
+	if !marker.GetAbsent() || marker.StartSeconds != nil || marker.EndSeconds != nil {
+		t.Fatalf("marker = %+v, want an absent answer without bounds", marker)
+	}
+	if marker.GetSegment() != "recap" || marker.GetConfidence() != 0.6 || marker.GetSubmissionCount() != 1 {
+		t.Fatalf("marker = %+v, want the claim's kind and evidence", marker)
+	}
+
+	// A host that reads a segment without bounds as covering the whole file
+	// must not receive one (marker_provider.proto: accepts_absent).
+	resp, err = server.FetchMarkers(context.Background(), request(false))
+	if err != nil {
+		t.Fatalf("FetchMarkers: %v", err)
+	}
+	if len(resp.GetMarkers()) != 0 {
+		t.Fatalf("markers = %+v, want none for a host without accepts_absent", resp.GetMarkers())
+	}
+}
+
 func TestMarkerServerPassesEpisodeIdentityAndDetails(t *testing.T) {
 	var gotQuery url.Values
 	server := testMarkerServer(t, func(w http.ResponseWriter, r *http.Request) {

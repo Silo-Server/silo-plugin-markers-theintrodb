@@ -91,12 +91,65 @@ func TestProviderKeepsRangesThatStartAtTheBeginning(t *testing.T) {
 	}
 }
 
+func TestProviderReportsNoSegmentAsAnAbsentAnswer(t *testing.T) {
+	const body = `{"tvdb_id":81189,"type":"tv","season":5,"episode":16,"group_duration_ms":3329000,
+		"recap":[{"start_ms":0,"end_ms":0,"confidence":0.6,"submission_count":1}],
+		"credits":[{"start_ms":3273872,"end_ms":null,"confidence":0.99,"submission_count":11}]}`
+	for _, tt := range []struct {
+		name    string
+		accepts bool
+		absent  bool
+	}{
+		{name: "host understands an absent answer", accepts: true, absent: true},
+		{name: "host reading no bounds as the whole file", accepts: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := episodeReq(map[string]string{ExternalIDKeyTVDB: "81189"})
+			req.Duration = 3329 * time.Second
+			req.AcceptsAbsent = tt.accepts
+			res, err := newProvider(t, body).FetchMarkers(context.Background(), req)
+			if err != nil {
+				t.Fatalf("FetchMarkers: %v", err)
+			}
+			want := []Marker{
+				{Kind: MarkerKindCredits, Start: 3273872 * time.Millisecond, End: 3329 * time.Second, Confidence: 0.99, SubmissionCount: 11, Algorithm: Algorithm},
+			}
+			if tt.absent {
+				want = append(want, Marker{Kind: MarkerKindRecap, Absent: true, Confidence: 0.6, SubmissionCount: 1, Algorithm: Algorithm})
+			}
+			if !reflect.DeepEqual(res.Markers, want) {
+				t.Fatalf("markers = %+v, want %+v", res.Markers, want)
+			}
+		})
+	}
+}
+
+func TestProviderReportsAbsenceFromAnotherRelease(t *testing.T) {
+	// A release whose length differs disqualifies the ranges, which would land
+	// in the wrong place, but not an answer about existence: "this item has no
+	// credits" is as true of the file as of the release it was timed on.
+	const body = `{"tvdb_id":169,"type":"movie","group_duration_ms":7800000,
+		"credits":[{"start_ms":0,"end_ms":0,"confidence":0.6,"submission_count":1}],
+		"preview":[{"start_ms":7900000,"end_ms":7950000}]}`
+	movie := Request{Kind: ItemKindMovie, ExternalIDs: map[string]string{ExternalIDKeyTMDB: "603"},
+		Duration: 9000 * time.Second, AcceptsAbsent: true}
+	res, err := newProvider(t, body).FetchMarkers(context.Background(), movie)
+	if err != nil {
+		t.Fatalf("FetchMarkers: %v", err)
+	}
+	want := []Marker{{Kind: MarkerKindCredits, Absent: true, Confidence: 0.6, SubmissionCount: 1, Algorithm: Algorithm}}
+	if !reflect.DeepEqual(res.Markers, want) {
+		t.Fatalf("markers = %+v, want the absence answer and no range from the other release", res.Markers)
+	}
+}
+
 func TestProviderIgnoresAClaimBesideAPlacement(t *testing.T) {
 	// A "no segment" entry answers for the whole kind, never for one slot in
 	// it: beside a placement it is not an answer and must not suppress it.
 	p := newProvider(t, `{"tvdb_id":121361,"type":"tv","season":1,"episode":1,
 		"intro":[{"start_ms":0,"end_ms":0},{"start_ms":210000,"end_ms":250000}]}`)
 	req := episodeReq(map[string]string{ExternalIDKeyTVDB: "121361"})
+	req.AcceptsAbsent = true
 	res, err := p.FetchMarkers(context.Background(), req)
 	if err != nil {
 		t.Fatalf("FetchMarkers: %v", err)

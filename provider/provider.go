@@ -56,24 +56,69 @@ func (p *Provider) FetchMarkers(ctx context.Context, req Request) (Result, error
 
 	endsApply := sameRelease(resp, req.Duration)
 	result := Result{}
-	result.Markers = append(result.Markers, convertMarkers(resp.Intro, MarkerKindIntro, req.Duration)...)
-	if endsApply {
-		result.Markers = append(result.Markers, convertMarkers(resp.Credits, MarkerKindCredits, req.Duration)...)
-	}
-	result.Markers = append(result.Markers, convertMarkers(resp.Recap, MarkerKindRecap, req.Duration)...)
-	if endsApply {
-		result.Markers = append(result.Markers, convertMarkers(resp.Preview, MarkerKindPreview, req.Duration)...)
-	}
+	// Intros and recaps are timed from the start of the file, so a release
+	// whose length differs still places them; credits and previews sit toward
+	// the end and are only served when the release matches. An absence answer
+	// has no position at all, so the release never gates it — see
+	// segmentMarkers.
+	result.Markers = append(result.Markers, segmentMarkers(resp.Intro, MarkerKindIntro, req.Duration, true, req.AcceptsAbsent)...)
+	result.Markers = append(result.Markers, segmentMarkers(resp.Credits, MarkerKindCredits, req.Duration, endsApply, req.AcceptsAbsent)...)
+	result.Markers = append(result.Markers, segmentMarkers(resp.Recap, MarkerKindRecap, req.Duration, true, req.AcceptsAbsent)...)
+	result.Markers = append(result.Markers, segmentMarkers(resp.Preview, MarkerKindPreview, req.Duration, endsApply, req.AcceptsAbsent)...)
 	return result, nil
 }
 
-// isNoSegmentClaim reports whether one entry is TheIntroDB's answer that the
-// segment does not exist. The API documents that answer as both times null
-// ("Submissions with null times for both start and end are marked as 'no
-// segment'") and serves it as a single entry with both bounds absent or zero.
-// It is about existence, not position, so it is never a range: a segment that
-// merely starts at the beginning of the file is not one, and neither is the
-// second range of a kind that occurs twice.
+// segmentMarkers turns one segment kind's served entries into markers. A kind
+// TheIntroDB answers with its "no segment" vote yields an absent marker, so the
+// host can tell an answer of "this item has none" from having no answer at all.
+// serveRanges is false when the response's release does not match the file:
+// that disqualifies the ranges, which would land in the wrong place, but not an
+// absence answer, which says nothing about position.
+func segmentMarkers(stamps []segmentTimestamps, kind MarkerKind, totalDuration time.Duration, serveRanges, acceptsAbsent bool) []Marker {
+	claim, isClaim := noSegmentClaim(stamps)
+	if !isClaim {
+		if !serveRanges {
+			return nil
+		}
+		return convertMarkers(stamps, kind, totalDuration)
+	}
+	// A host that predates accepts_absent reads a marker without bounds as
+	// covering the whole file, so it is sent nothing rather than a marker it
+	// would misread.
+	if !acceptsAbsent {
+		return nil
+	}
+	marker := Marker{Kind: kind, Absent: true, Confidence: defaultConfidence, Algorithm: Algorithm}
+	if claim.Confidence != nil && *claim.Confidence >= 0 && *claim.Confidence <= 1 {
+		marker.Confidence = *claim.Confidence
+	}
+	if claim.SubmissionCount != nil && *claim.SubmissionCount > 0 {
+		marker.SubmissionCount = *claim.SubmissionCount
+	}
+	return []Marker{marker}
+}
+
+// noSegmentClaim reports whether a kind's entries are TheIntroDB's answer that
+// the segment does not exist: a single entry with both bounds absent or zero,
+// which is about existence rather than position and can never be served or
+// grouped as a range. The vote has already run inside TheIntroDB, so an entry
+// beside it means the kind has placements and this is not an answer.
+func noSegmentClaim(stamps []segmentTimestamps) (segmentTimestamps, bool) {
+	if len(stamps) != 1 {
+		return segmentTimestamps{}, false
+	}
+	entry := stamps[0]
+	if isNoSegmentClaim(entry) {
+		return entry, true
+	}
+	return segmentTimestamps{}, false
+}
+
+// isNoSegmentClaim reports whether one entry carries no position at all. Both
+// bounds zero or absent is the whole test: a range that merely starts at the
+// beginning of the file is a placement, and TheIntroDB serves those (a credits
+// block the community placed at 0:00 beside the end-credits block is two
+// ranges, and a post-credits scene is a second, later one).
 func isNoSegmentClaim(entry segmentTimestamps) bool {
 	startAbsent := entry.StartMs == nil || *entry.StartMs == 0
 	endAbsent := entry.EndMs == nil || *entry.EndMs == 0

@@ -57,16 +57,24 @@ func (s *markerServer) FetchMarkers(ctx context.Context, req *pluginv1.FetchMark
 	}
 	out := &pluginv1.FetchMarkersResponse{}
 	for _, marker := range res.Markers {
-		start := marker.Start.Seconds()
-		end := marker.End.Seconds()
-		out.Markers = append(out.Markers, &pluginv1.MarkerSegment{
+		segment := &pluginv1.MarkerSegment{
 			Segment:         markerKindName(marker.Kind),
-			StartSeconds:    &start,
-			EndSeconds:      &end,
 			Confidence:      marker.Confidence,
 			SubmissionCount: int32(marker.SubmissionCount),
 			Algorithm:       marker.Algorithm,
-		})
+		}
+		// An absent answer has no bounds: start_seconds and end_seconds stay
+		// unset, or a host that reads a segment without bounds as the whole
+		// file plays it (marker_provider.proto, MarkerSegment.absent).
+		if marker.Absent {
+			segment.Absent = true
+		} else {
+			start := marker.Start.Seconds()
+			end := marker.End.Seconds()
+			segment.StartSeconds = &start
+			segment.EndSeconds = &end
+		}
+		out.Markers = append(out.Markers, segment)
 	}
 	return out, nil
 }
@@ -159,6 +167,7 @@ func requestFromProto(req *pluginv1.FetchMarkersRequest) provider.Request {
 		EpisodeNumber: int(req.GetEpisodeNumber()),
 		Episode:       episodeFromProto(req.GetEpisodeExternalIds(), req.GetEpisodeNumbering(), req.GetEpisodeTitle()),
 		Duration:      secondsDuration(req.GetDurationSeconds()),
+		AcceptsAbsent: req.GetAcceptsAbsent(),
 	}
 }
 

@@ -57,6 +57,12 @@ type Request struct {
 	EpisodeNumber int
 	Episode       Episode
 	Duration      time.Duration
+	// AcceptsAbsent is the host's marker_provider.accepts_absent flag: it
+	// understands a marker that asserts the item has no segment of a kind,
+	// where a host that predates the flag reads the same marker as covering
+	// the whole file. TheIntroDB answers an explicit "no segment" vote with a
+	// single zero-bounded entry, which is only reported when this is true.
+	AcceptsAbsent bool
 }
 
 // Episode is what Silo knows about an episode beyond its series' IDs. All
@@ -84,6 +90,11 @@ type Marker struct {
 	Confidence      float64
 	SubmissionCount int
 	Algorithm       string
+	// Absent asserts the item has no segment of this kind, which is
+	// TheIntroDB's answer when the community has voted that the segment does
+	// not exist. Absent markers carry no bounds — reading one as a segment
+	// would cover the whole file — so Start and End are zero and unused.
+	Absent bool
 }
 
 // SubmissionRequest describes one segment to contribute. The item fields
