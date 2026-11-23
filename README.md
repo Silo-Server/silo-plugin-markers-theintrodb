@@ -28,14 +28,22 @@ TheIntroDB answers with a release more than five minutes longer or shorter than
 the file, its credits and previews are dropped, since they would land in the
 wrong place; intros and recaps are kept.
 
+Every entry TheIntroDB serves is preserved, including the two intros some
+episodes have and the separate credits ranges that surround a scene to keep: a
+range is only discarded when it cannot belong to the file, such as an intro
+ending past its end or a credits range that its release's length cannot place.
+
 Submissions that TheIntroDB would read as "no segment" (credits or a preview
 starting at 0, an intro or recap ending at 0, an empty range) or cannot accept
-are refused locally, and Silo records them as permanent refusals. After
+are refused locally, and Silo records them as permanent refusals. Refusing a
+credits range that starts at 0 is deliberate and matches TheIntroDB's
+submission guidelines, which put a start-of-episode credit sequence under
+`intro`; a lookup still forwards one the API serves, because the community's own
+vote decides what the database answers. After
 TheIntroDB rejects the API key, submissions stop for an hour or until the key
 changes or validates.
 
-Each returned segment is preserved, including separate credits ranges around a
-mid-credits scene. Lookup responses are cached for up to 24 hours in a bounded
+Lookup responses are cached for up to 24 hours in a bounded
 cache; changing credentials or submitting a marker clears that cache. The
 lookup rate follows the ceiling TheIntroDB reports in `X-RateLimit-Limit`.
 Quota responses include the upstream reset delay so Silo can schedule the next

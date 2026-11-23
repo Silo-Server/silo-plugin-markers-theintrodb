@@ -67,6 +67,46 @@ func TestProviderPreservesSegmentOccurrences(t *testing.T) {
 	}
 }
 
+func TestProviderKeepsRangesThatStartAtTheBeginning(t *testing.T) {
+	// TheIntroDB serves a credits block the community placed at the start of
+	// the file beside the end-credits block, and a movie's post-credits scene
+	// as a second, later range. The API marks "no segment" as both times null
+	// or zero, so a range that starts at the beginning is a placement like any
+	// other.
+	p := newProvider(t, `{"tvdb_id":78857,"type":"tv","season":4,"episode":13,"group_duration_ms":1414000,
+		"credits":[{"start_ms":0,"end_ms":89465,"confidence":0.6,"submission_count":1},
+			{"start_ms":1284000,"end_ms":null,"confidence":0.6,"submission_count":1}]}`)
+	req := episodeReq(map[string]string{ExternalIDKeyTVDB: "78857"})
+	req.Duration = 1414 * time.Second
+	res, err := p.FetchMarkers(context.Background(), req)
+	if err != nil {
+		t.Fatalf("FetchMarkers: %v", err)
+	}
+	want := []Marker{
+		{Kind: MarkerKindCredits, End: 89465 * time.Millisecond, Confidence: 0.6, SubmissionCount: 1, Algorithm: Algorithm},
+		{Kind: MarkerKindCredits, Start: 1284 * time.Second, End: 1414 * time.Second, Confidence: 0.6, SubmissionCount: 1, Algorithm: Algorithm},
+	}
+	if !reflect.DeepEqual(res.Markers, want) {
+		t.Fatalf("markers = %+v, want both served credits ranges", res.Markers)
+	}
+}
+
+func TestProviderIgnoresAClaimBesideAPlacement(t *testing.T) {
+	// A "no segment" entry answers for the whole kind, never for one slot in
+	// it: beside a placement it is not an answer and must not suppress it.
+	p := newProvider(t, `{"tvdb_id":121361,"type":"tv","season":1,"episode":1,
+		"intro":[{"start_ms":0,"end_ms":0},{"start_ms":210000,"end_ms":250000}]}`)
+	req := episodeReq(map[string]string{ExternalIDKeyTVDB: "121361"})
+	res, err := p.FetchMarkers(context.Background(), req)
+	if err != nil {
+		t.Fatalf("FetchMarkers: %v", err)
+	}
+	want := []Marker{{Kind: MarkerKindIntro, Start: 210 * time.Second, End: 250 * time.Second, Confidence: defaultConfidence, Algorithm: Algorithm}}
+	if !reflect.DeepEqual(res.Markers, want) {
+		t.Fatalf("markers = %+v, want only the placement", res.Markers)
+	}
+}
+
 func TestProviderValidatesSegmentBounds(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
