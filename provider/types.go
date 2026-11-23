@@ -142,9 +142,10 @@ func (e *RetryAfterError) Error() string {
 }
 
 // mediaResponse mirrors the JSON shape returned by GET /v4/media. Each
-// segment kind is an array of zero or more entries; absent fields are decoded
-// as empty slices via Go's zero-value semantics. The episode-list fallback
-// TheIntroDB sends for media without submissions decodes to no segments.
+// segment kind is an array of zero or more entries, and one kind can hold
+// several entries — some episodes have two intros, and credits often surround
+// a scene to keep. The episode-list fallback TheIntroDB sends for media
+// without submissions decodes to no segments.
 type mediaResponse struct {
 	TvdbID int    `json:"tvdb_id"`
 	Type   string `json:"type"`

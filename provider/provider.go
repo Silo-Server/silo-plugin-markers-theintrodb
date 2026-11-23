@@ -67,6 +67,19 @@ func (p *Provider) FetchMarkers(ctx context.Context, req Request) (Result, error
 	return result, nil
 }
 
+// isNoSegmentClaim reports whether one entry is TheIntroDB's answer that the
+// segment does not exist. The API documents that answer as both times null
+// ("Submissions with null times for both start and end are marked as 'no
+// segment'") and serves it as a single entry with both bounds absent or zero.
+// It is about existence, not position, so it is never a range: a segment that
+// merely starts at the beginning of the file is not one, and neither is the
+// second range of a kind that occurs twice.
+func isNoSegmentClaim(entry segmentTimestamps) bool {
+	startAbsent := entry.StartMs == nil || *entry.StartMs == 0
+	endAbsent := entry.EndMs == nil || *entry.EndMs == 0
+	return startAbsent && endAbsent
+}
+
 // releaseTolerance is how far apart TheIntroDB treats two durations as one
 // release.
 const releaseTolerance = 5 * time.Minute
@@ -93,6 +106,11 @@ func convertMarkers(stamps []segmentTimestamps, kind MarkerKind, totalDuration t
 		if !validTimestamp(s.StartMs) || !validTimestamp(s.EndMs) {
 			continue
 		}
+		// A "no segment" entry beside a placement is not an answer about the
+		// kind, and it carries no position to serve.
+		if isNoSegmentClaim(s) {
+			continue
+		}
 		start := time.Duration(0)
 		end := totalDuration
 		if s.StartMs != nil {
@@ -101,11 +119,13 @@ func convertMarkers(stamps []segmentTimestamps, kind MarkerKind, totalDuration t
 		if s.EndMs != nil {
 			end = time.Duration(*s.EndMs) * time.Millisecond
 		}
+		// TheIntroDB requires an end for intro and recap, and a start for
+		// credits and preview; an entry missing the required bound is not a
+		// range either type can play.
 		if requireEnd && s.EndMs == nil {
 			continue
 		}
-		// Zero is TheIntroDB's no-segment sentinel for credits and previews.
-		if !requireEnd && (s.StartMs == nil || start == 0) {
+		if !requireEnd && s.StartMs == nil {
 			continue
 		}
 		// Credits and previews run to the end of the release they were timed
